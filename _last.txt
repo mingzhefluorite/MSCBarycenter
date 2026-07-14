@@ -1,0 +1,96 @@
+# Reconstruct and draw FGW barycenter graph
+# MST first (connectivity), then strict / loose degree-constrained passes.
+
+import importlib
+import lib.graph_reader as graph_reader
+
+importlib.reload(graph_reader)
+from lib.graph_reader import (
+    reconstruct_msc_degree_constrained_graph,
+    msc_barycenter_weight_euclidean_differences,
+    msc_barycenter_weight_euclidean_debug,
+    plot_msc_barycenter_weight_euclidean_debug,
+)
+
+
+def draw_msc_barycenter_graph(G, figsize=(16.0, 12.0)):
+    from matplotlib.lines import Line2D
+
+    pos = {n: np.array([G.nodes[n]["x"], G.nodes[n]["y"]], dtype=float) for n in G.nodes()}
+    fig, ax = plt.subplots(figsize=figsize)
+
+    edges_mst = [(u, v) for u, v, d in G.edges(data=True) if d.get("edge_pass") == "mst"]
+    edges_strict = [(u, v) for u, v, d in G.edges(data=True) if d.get("edge_pass") == "strict"]
+    edges_loose = [(u, v) for u, v, d in G.edges(data=True) if d.get("edge_pass") == "loose"]
+
+    if edges_mst:
+        nx.draw_networkx_edges(G, pos, edgelist=edges_mst, width=1.5, alpha=0.7, edge_color="#444444", ax=ax)
+    if edges_strict:
+        nx.draw_networkx_edges(G, pos, edgelist=edges_strict, width=1.5, alpha=0.85, edge_color="#2ca02c", ax=ax)
+    if edges_loose:
+        nx.draw_networkx_edges(
+            G, pos, edgelist=edges_loose, width=2.0, alpha=0.95, edge_color="#d62728", style="dashed", ax=ax
+        )
+
+    nx.draw_networkx_nodes(G, pos, node_size=5, node_color="#1f77b4", ax=ax)
+
+    n_alarm = len(edges_loose)
+    ax.set_title(
+        f"PFGW barycenter — {G.number_of_nodes()} nodes, {G.number_of_edges()} edges"
+        + (f" ({n_alarm} alarm)" if n_alarm else "")
+    )
+    ax.set_xlabel("x")
+    ax.set_ylabel("y")
+    ax.set_aspect("equal", adjustable="box")
+    ax.legend(
+        handles=[
+            Line2D([0], [0], color="#444444", linewidth=2, label="MST (connectivity)"),
+            Line2D([0], [0], color="#2ca02c", linewidth=2, label="Strict degree pass"),
+            Line2D([0], [0], color="#d62728", linewidth=2, linestyle="--", label="Loose pass (artifact alarm)"),
+        ],
+        loc="upper left",
+        bbox_to_anchor=(1.02, 1.0),
+        borderaxespad=0.0,
+        fontsize=9,
+    )
+    fig.tight_layout(rect=[0, 0, 0.82, 1])
+    plt.show()
+
+
+G_center = reconstruct_msc_degree_constrained_graph(
+    C_center,
+    X_center,
+    min_x=min_x,
+    min_y=min_y,
+    min_z=min_z,
+    domain_size=domain_size,
+    max_degree=max_degree,
+    relation_kind=relation_kind,
+    relation_rescale=relation_rescale,
+    relation_offset=relation_offset,
+    sp_weighted=sp_weighted,
+)
+
+n_mst = sum(1 for _, _, d in G_center.edges(data=True) if d.get("edge_pass") == "mst")
+n_strict = sum(1 for _, _, d in G_center.edges(data=True) if d.get("edge_pass") == "strict")
+n_loose = sum(1 for _, _, d in G_center.edges(data=True) if d.get("edge_pass") == "loose")
+print(
+    f"Barycenter graph: {G_center.number_of_nodes()} nodes, {G_center.number_of_edges()} edges "
+    f"(mst={n_mst}, strict={n_strict}, loose/alarm={n_loose})"
+)
+
+# Debug: unscaled edge weight vs 3D Euclidean (inverse of relation_rescale from FGW)
+weight_eucl_diffs = msc_barycenter_weight_euclidean_differences(
+    G_center, relation_rescale=relation_rescale, relation_offset=relation_offset, relation_kind=relation_kind
+)
+print("unscaled weight - euclidean (all edges):", weight_eucl_diffs)
+debug_info = plot_msc_barycenter_weight_euclidean_debug(
+    G_center,
+    relation_rescale=relation_rescale,
+    relation_offset=relation_offset,
+    relation_kind=relation_kind,
+    bins=40,
+    by_pass=True,
+)
+
+draw_msc_barycenter_graph(G_center)
