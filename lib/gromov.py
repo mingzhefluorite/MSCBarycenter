@@ -968,9 +968,31 @@ def partial_fused_gromov_ver1(
     **kwargs
 ):
     r"""
-    Solves the Partial Fused Gromov-Wasserstein problem and returns the OT plan.
+    Solve the penalized partial Fused Gromov-Wasserstein problem.
 
-    Minimizes (1-alpha) * <T, M> + alpha * PGW(C1, C2, T) with partial mass constraints.
+    The optimized objective is
+
+        (1 - alpha) * <M, G>
+        + alpha * Q(C1, C2, G)
+        + Lambda * (
+            sum(p)**2
+            + sum(q)**2
+            - 2 * sum(G)**2
+        ),
+
+    over nonnegative partial couplings G satisfying
+
+        G @ 1 <= p,
+        G.T @ 1 <= q.
+
+    Here,
+
+        Q(C1, C2, G)
+        = sum_{i,j,k,l}
+            (C1[i,k] - C2[j,l])**2
+            * G[i,j] * G[k,l].
+
+    This implementation assumes C1 and C2 are symmetric.
 
     Parameters
     ----------
@@ -996,9 +1018,9 @@ def partial_fused_gromov_ver1(
     err = 1
 
     if log:
-        log_dict = {"err": [], "G0_mass": [], "Gprev_mass": []}
+        log_dict = {"err": [], "G0_mass": [], "Gprev_mass": [], "emd_logs": [],}
 
-    fC1, fC2, hC1, hC2 = tensor_dot_param(C1, C2, Lambda, loss="square_loss")
+    fC1, fC2, hC1, hC2 = tensor_dot_param(C1, C2, 0.0, loss="square_loss")
     fC1, fC2, hC1, hC2 = (
         np.ascontiguousarray(fC1),
         np.ascontiguousarray(fC2),
@@ -1025,9 +1047,12 @@ def partial_fused_gromov_ver1(
         Gprev = G0.copy()
 
         Mt_circ_G = tensor_dot_func(fC1, fC2, hC1, hC2, Gprev)
-        M_extended[0:n, 0:m] = (1 - alpha) * M + alpha * Mt_circ_G
+        # M_extended[0:n, 0:m] = (1 - alpha) * M + alpha * Mt_circ_G
+        matched_mass = Gprev.sum()
+        half_grad = (0.5 * (1-alpha) * M + alpha * Mt_circ_G - 2.0 * Lambda * matched_mass)
+        M_extended[0:n, 0:m] = half_grad
 
-        gamma_extended, log_dict = emd_lp(
+        gamma_extended, emd_log = emd_lp(
             mu_extended,
             nu_extended,
             M_extended,
@@ -1035,29 +1060,20 @@ def partial_fused_gromov_ver1(
             log=log,
             **kwargs
         )
+        
+        if log:
+            log_dict["emd_logs"].append(emd_log)
 
         G0 = G0_orig.copy()
         G0[0:n, 0:m] = gamma_extended[:-1, :-1]
 
-        if cpt % 10 == 0:
-            err = np.linalg.norm(G0 - Gprev)
-            if log:
-                log["err"].append(err)
-            if verbose:
-                if cpt % 200 == 0:
-                    print(
-                        "{:5s}|{:12s}|{:12s}".format("It.", "Err", "Loss")
-                        + "\n" + "-" * 31
-                    )
-                fgw_loss = (1 - alpha) * np.sum(M * G0) + alpha * gwloss_partial(C1, C2, G0)
-                print("{:5d}|{:8e}|{:8e}".format(cpt, err, fgw_loss))
-
         deltaG = G0 - Gprev
         if line_search:
             Mt_circ_deltaG = tensor_dot_func(fC1, fC2, hC1, hC2, deltaG)
-            a = alpha * np.sum(Mt_circ_deltaG * deltaG)
-            M_combined = (1 - alpha) * M + alpha * Mt_circ_G
-            b = 2 * np.sum(M_combined * deltaG)
+            delta_mass = deltaG.sum()
+            a = alpha * np.sum(Mt_circ_deltaG * deltaG) - 2.0 * Lambda * delta_mass**2
+            # M_combined = (1 - alpha) * M + alpha * Mt_circ_G
+            b = 2 * np.sum(half_grad * deltaG)
             if a > 0:
                 if b >= 0:
                     alpha_ls = 0
@@ -1072,8 +1088,30 @@ def partial_fused_gromov_ver1(
                     cpt = numItermax_gw
         else:
             alpha_ls = 1
+            
+        Gnew = Gprev + alpha_ls * deltaG
+        if cpt % 10 == 0:
+            scale = max(
+                np.linalg.norm(Gprev),
+                np.linalg.norm(Gnew),
+                1e-15,
+            )
+            err = np.linalg.norm(Gnew - Gprev) / scale
+            if log:
+                log_dict["err"].append(err)
+                log_dict["G0_mass"].append(Gnew.sum())
+                log_dict["Gprev_mass"].append(Gprev.sum())
+            if verbose:
+                if cpt % 200 == 0:
+                    print(
+                        "{:5s}|{:12s}|{:12s}".format("It.", "Err", "Loss")
+                        + "\n" + "-" * 31
+                    )
+                fpgw_loss = (1 - alpha) * np.sum(M * Gnew) + alpha * gwloss_partial(C1, C2, Gnew)  \
+                            + Lambda * (p_sum ** 2 + q_sum ** 2 - 2.0 * Gnew.sum() ** 2) / 2.0
+                print("{:5d}|{:8e}|{:8e}".format(cpt, err, fpgw_loss))
 
-        G0 = Gprev + alpha_ls * deltaG
+        G0 = Gnew
         cpt += 1
 
     if log:

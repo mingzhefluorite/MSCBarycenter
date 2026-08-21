@@ -7,12 +7,13 @@ grid with the eight outer peaks on the domain boundary (corners and edge midpoin
 and a taller central peak (~2x the boundary height). A small offset inside the
 periodic factors avoids flat valley plateaus.
 
-Four additional instances add smoothed random Gaussian noise on top of the base field.
-Noise amplitude is weighted by (1 - height): small near the tall center peak (topology
-preserved) and larger on lower/saddle-rich periphery (irregular MSC boundaries).
-Noise is further restricted to the lower-left quadrant (x <= 0.5 and y <= 0.5)
-when --restrict-noise-region is enabled (default on; use --no-restrict-noise-region
-to disable).
+Noisy instances add a controllable number of localized Gaussian bumps *or* dips
+on top of that regular pattern (see --n-bumps). Each feature is centered on a
+random allowed grid pixel, uses a random anisotropic Gaussian shape, and a fair
+coin flip chooses bump (+) vs dip (-). Magnitude and footprint stay smaller than
+the regular egg-carton / center peaks. Placement can be restricted to the
+lower-left quadrant (x <= 0.5 and y <= 0.5) when --restrict-noise-region is
+enabled (default on; use --no-restrict-noise-region to disable).
 
 Run with ParaView's pvpython, e.g.:
 
@@ -51,12 +52,18 @@ SURFACE_OFFSET = 0.05
 # 0 = peaks on boundary (corners at 0/1); 0.05 moves them to x,y in {0.05, 0.95}.
 PEAK_INSET = 0.02
 
-# Smoothed random noise (std in height units). Light blur avoids single-pixel speckle.
-NOISE_STD = 0.03
-NOISE_SMOOTH_SIGMA_CELLS = 4.0
-# Weight ~ (1 - height)^power: 1 = linear, >1 suppresses noise on mid-height ridges.
-NOISE_HEIGHT_POWER = 5.0
-# If True, noise is applied only where x <= MAX_X/2 and y <= MAX_Y/2.
+# Localized noisy bumps/dips on top of the regular base field.
+# Regular center bump uses BUMP_SIGMA=0.12 and spans ~full [HEIGHT_MIN, HEIGHT_MAX]
+# after normalization; noisy features stay strictly smaller in footprint and |height|.
+DEFAULT_N_NOISE_BUMPS = 1
+NOISE_BUMP_HEIGHT_MIN = 0.08  # |peak| magnitude (normalized units)
+NOISE_BUMP_HEIGHT_MAX = 0.18
+NOISE_BUMP_SIGMA_MIN = 0.025  # domain units; must stay < BUMP_SIGMA
+NOISE_BUMP_SIGMA_MAX = 0.055
+NOISE_BUMP_MARGIN = 0.05  # keep feature centers away from domain edge
+NOISE_BUMP_MIN_SEPARATION = 0.06
+NOISE_BUMP_DIP_PROB = 0.5  # P(dip); 1 - this is P(bump)
+# If True, noisy features are placed only where x <= MAX_X/2 and y <= MAX_Y/2.
 NOISE_REGION_RESTRICT = True
 
 
@@ -119,84 +126,165 @@ def base_height_field(
     return normalize_height(periodic + bump)
 
 
-def _gaussian_kernel_1d(sigma_cells: float) -> np.ndarray:
-    radius = max(1, int(3.0 * sigma_cells))
-    coords = np.arange(-radius, radius + 1, dtype=np.float64)
-    kernel = np.exp(-0.5 * (coords / sigma_cells) ** 2)
-    kernel /= kernel.sum()
-    return kernel
-
-
-def _blur_separable(field: np.ndarray, sigma_cells: float) -> np.ndarray:
-    kernel = _gaussian_kernel_1d(sigma_cells)
-
-    def blur_axis(arr: np.ndarray, axis: int) -> np.ndarray:
-        out = np.empty_like(arr)
-        if axis == 0:
-            for i in range(arr.shape[0]):
-                out[i, :] = np.convolve(arr[i, :], kernel, mode="same")
-        else:
-            for j in range(arr.shape[1]):
-                out[:, j] = np.convolve(arr[:, j], kernel, mode="same")
-        return out
-
-    return blur_axis(blur_axis(field, axis=0), axis=1)
-
-
-def smoothed_gaussian_noise(
-    shape: tuple[int, int],
-    std: float,
-    smooth_sigma_cells: float,
-    rng: np.random.Generator,
-) -> np.ndarray:
-    """Irregular random field: i.i.d. Gaussian draws with light separable smoothing."""
-    white = rng.normal(0.0, 1.0, shape).astype(np.float64)
-    if smooth_sigma_cells <= 0.0:
-        return (white * std).astype(np.float32)
-    smooth = _blur_separable(white, smooth_sigma_cells)
-    smooth *= std / (float(smooth.std()) + 1e-12)
-    return smooth.astype(np.float32)
-
-
-def noise_sensitivity_weight(
-    base: np.ndarray,
-    height_power: float = NOISE_HEIGHT_POWER,
-) -> np.ndarray:
-    """Higher weight where the base field is lower (periphery / saddles vs center peak)."""
-    h_min = float(base.min())
-    h_max = float(base.max())
-    h_norm = (base.astype(np.float64) - h_min) / (h_max - h_min + 1e-12)
-    weight = np.clip(1.0 - h_norm, 0.0, 1.0)
-    if height_power != 1.0:
-        weight = weight**height_power
-    return weight.astype(np.float32)
-
-
 def noise_region_mask(x: np.ndarray, y: np.ndarray) -> np.ndarray:
     """True where noise is allowed: lower-left quadrant x <= MAX_X/2, y <= MAX_Y/2."""
     max_x = float(np.max(x))
     max_y = float(np.max(y))
-    return ((x <= max_x / 2.0) & (y <= max_y / 2.0)).astype(np.float32)
+    return ((x <= max_x / 2.0) & (y <= max_y / 2.0))
 
 
-def height_weighted_noise(
-    base: np.ndarray,
+def _allowed_pixel_mask(
     x: np.ndarray,
     y: np.ndarray,
-    rng: np.random.Generator,
-    noise_std: float = NOISE_STD,
-    smooth_sigma_cells: float = NOISE_SMOOTH_SIGMA_CELLS,
-    height_power: float = NOISE_HEIGHT_POWER,
-    restrict_noise_region: bool = NOISE_REGION_RESTRICT,
+    *,
+    restrict_noise_region: bool,
+    margin: float,
 ) -> np.ndarray:
-    """Smoothed Gaussian noise, amplitude modulated by base height and optional region."""
-    raw = smoothed_gaussian_noise(
-        base.shape, noise_std, smooth_sigma_cells, rng
+    """Boolean mask of grid pixels eligible as noisy-bump centers."""
+    max_x = float(np.max(x))
+    max_y = float(np.max(y))
+    min_x = float(np.min(x))
+    min_y = float(np.min(y))
+    mask = (
+        (x >= min_x + margin)
+        & (x <= max_x - margin)
+        & (y >= min_y + margin)
+        & (y <= max_y - margin)
     )
-    weight = noise_sensitivity_weight(base, height_power=height_power)
     if restrict_noise_region:
-        weight = weight * noise_region_mask(x, y)
-    return (raw * weight).astype(np.float32)
+        mask &= noise_region_mask(x, y)
+    return mask
+
+
+def _anisotropic_gaussian(
+    x: np.ndarray,
+    y: np.ndarray,
+    cx: float,
+    cy: float,
+    amplitude: float,
+    sigma_x: float,
+    sigma_y: float,
+    theta: float,
+) -> np.ndarray:
+    """Anisotropic Gaussian feature, rotated by ``theta`` radians.
+
+    ``amplitude`` may be positive (bump) or negative (dip).
+    """
+    dx = x - cx
+    dy = y - cy
+    ct = np.cos(theta)
+    st = np.sin(theta)
+    xr = ct * dx + st * dy
+    yr = -st * dx + ct * dy
+    sx2 = max(sigma_x, 1e-6) ** 2
+    sy2 = max(sigma_y, 1e-6) ** 2
+    return amplitude * np.exp(-0.5 * (xr * xr / sx2 + yr * yr / sy2))
+
+
+def noisy_bumps_field(
+    x: np.ndarray,
+    y: np.ndarray,
+    n_bumps: int,
+    rng: np.random.Generator,
+    *,
+    height_min: float = NOISE_BUMP_HEIGHT_MIN,
+    height_max: float = NOISE_BUMP_HEIGHT_MAX,
+    sigma_min: float = NOISE_BUMP_SIGMA_MIN,
+    sigma_max: float = NOISE_BUMP_SIGMA_MAX,
+    margin: float = NOISE_BUMP_MARGIN,
+    min_separation: float = NOISE_BUMP_MIN_SEPARATION,
+    dip_prob: float = NOISE_BUMP_DIP_PROB,
+    restrict_noise_region: bool = NOISE_REGION_RESTRICT,
+    max_tries_per_bump: int = 200,
+) -> tuple[np.ndarray, list[dict]]:
+    """
+    Add ``n_bumps`` Gaussian bumps/dips by sampling random pixels.
+
+    Each feature:
+      - center = random allowed grid pixel (optional quadrant restriction)
+      - shape = random anisotropic Gaussian (``sigma_x``, ``sigma_y``, ``theta``)
+      - magnitude = uniform in ``[height_min, height_max]``
+      - sign = coin flip: bump (+) with probability ``1 - dip_prob``, else dip (-)
+      - footprint and |height| stay below the regular peaks
+        (``BUMP_SIGMA``, full normalized height span)
+    """
+    if n_bumps < 0:
+        raise ValueError(f"n_bumps must be >= 0, got {n_bumps}")
+    if height_min <= 0.0 or height_max < height_min:
+        raise ValueError(
+            f"Need 0 < height_min <= height_max, got [{height_min}, {height_max}]"
+        )
+    if not (0.0 <= dip_prob <= 1.0):
+        raise ValueError(f"dip_prob must be in [0, 1], got {dip_prob}")
+    if sigma_min <= 0.0 or sigma_max < sigma_min:
+        raise ValueError(
+            f"Need 0 < sigma_min <= sigma_max, got [{sigma_min}, {sigma_max}]"
+        )
+    if sigma_max >= BUMP_SIGMA:
+        raise ValueError(
+            f"noise bump sigma_max ({sigma_max}) must be < regular BUMP_SIGMA ({BUMP_SIGMA})"
+        )
+
+    field = np.zeros_like(x, dtype=np.float64)
+    if n_bumps == 0:
+        return field.astype(np.float32), []
+
+    allowed = _allowed_pixel_mask(
+        x, y, restrict_noise_region=restrict_noise_region, margin=margin
+    )
+    flat = np.flatnonzero(allowed.ravel(order="C"))
+    if flat.size == 0:
+        raise ValueError(
+            "No eligible pixels for noisy features; reduce margin or disable "
+            "--restrict-noise-region."
+        )
+
+    min_sep2 = float(min_separation) ** 2
+    centers: list[tuple[float, float]] = []
+    records: list[dict] = []
+
+    for _ in range(n_bumps):
+        chosen = None
+        for _try in range(max_tries_per_bump):
+            idx = int(rng.choice(flat))
+            i, j = np.unravel_index(idx, x.shape)
+            cx = float(x[i, j])
+            cy = float(y[i, j])
+            if all((cx - px) ** 2 + (cy - py) ** 2 >= min_sep2 for px, py in centers):
+                chosen = (i, j, cx, cy)
+                break
+        if chosen is None:
+            idx = int(rng.choice(flat))
+            i, j = np.unravel_index(idx, x.shape)
+            chosen = (i, j, float(x[i, j]), float(y[i, j]))
+
+        i, j, cx, cy = chosen
+        centers.append((cx, cy))
+        magnitude = float(rng.uniform(height_min, height_max))
+        is_dip = bool(rng.random() < dip_prob)
+        kind = "dip" if is_dip else "bump"
+        amplitude = -magnitude if is_dip else magnitude
+        sigma_x = float(rng.uniform(sigma_min, sigma_max))
+        sigma_y = float(rng.uniform(sigma_min, sigma_max))
+        theta = float(rng.uniform(0.0, np.pi))
+        field += _anisotropic_gaussian(
+            x, y, cx, cy, amplitude, sigma_x, sigma_y, theta
+        )
+        records.append(
+            {
+                "i": int(i),
+                "j": int(j),
+                "cx": cx,
+                "cy": cy,
+                "kind": kind,
+                "amplitude": amplitude,
+                "sigma_x": sigma_x,
+                "sigma_y": sigma_y,
+                "theta": theta,
+            }
+        )
+
+    return field.astype(np.float32), records
 
 
 def build_coordinate_arrays(nx: int, ny: int) -> tuple[np.ndarray, np.ndarray]:
@@ -246,9 +334,14 @@ def generate_instances(
     nx: int,
     ny: int,
     n_noisy: int,
-    noise_std: float,
-    noise_smooth_sigma_cells: float,
-    noise_height_power: float,
+    n_bumps: int,
+    noise_bump_height_min: float,
+    noise_bump_height_max: float,
+    noise_bump_sigma_min: float,
+    noise_bump_sigma_max: float,
+    noise_bump_margin: float,
+    noise_bump_min_separation: float,
+    noise_bump_dip_prob: float,
     peak_inset: float,
     seed: int,
     scalar_name: str,
@@ -265,20 +358,41 @@ def generate_instances(
 
     rng = np.random.default_rng(seed)
     for idx in range(n_noisy):
-        noise = height_weighted_noise(
-            base,
+        noise, records = noisy_bumps_field(
             x,
             y,
+            n_bumps,
             rng,
-            noise_std=noise_std,
-            smooth_sigma_cells=noise_smooth_sigma_cells,
-            height_power=noise_height_power,
+            height_min=noise_bump_height_min,
+            height_max=noise_bump_height_max,
+            sigma_min=noise_bump_sigma_min,
+            sigma_max=noise_bump_sigma_max,
+            margin=noise_bump_margin,
+            min_separation=noise_bump_min_separation,
+            dip_prob=noise_bump_dip_prob,
             restrict_noise_region=restrict_noise_region,
         )
         noisy = (base + noise).astype(np.float32)
         out_path = output_dir / f"synthetic_noise_{idx + 1:02d}.vti"
         write_vti(out_path, noisy, scalar_name=scalar_name)
         written.append(out_path)
+
+        centers_path = output_dir / f"synthetic_noise_{idx + 1:02d}_bumps.txt"
+        with centers_path.open("w", encoding="utf-8") as f:
+            f.write("# index  i  j  cx  cy  kind  amplitude  sigma_x  sigma_y  theta\n")
+            for k, rec in enumerate(records):
+                f.write(
+                    f"{k}  {rec['i']}  {rec['j']}  "
+                    f"{rec['cx']:.8f}  {rec['cy']:.8f}  {rec['kind']}  "
+                    f"{rec['amplitude']:.8f}  {rec['sigma_x']:.8f}  "
+                    f"{rec['sigma_y']:.8f}  {rec['theta']:.8f}\n"
+                )
+        n_bump = sum(1 for r in records if r["kind"] == "bump")
+        n_dip = len(records) - n_bump
+        print(
+            f"{out_path.name}: {len(records)} feature(s) "
+            f"({n_bump} bump, {n_dip} dip; centers -> {centers_path.name})"
+        )
 
     return written
 
@@ -303,28 +417,55 @@ def parse_args() -> argparse.Namespace:
         help="Number of noisy instances to generate",
     )
     parser.add_argument(
-        "--noise-std",
-        type=float,
-        default=NOISE_STD,
-        help="Overall scale of smoothed Gaussian noise",
-    )
-    parser.add_argument(
-        "--noise-smooth-sigma-cells",
-        type=float,
-        default=NOISE_SMOOTH_SIGMA_CELLS,
+        "--n-bumps",
+        type=int,
+        default=DEFAULT_N_NOISE_BUMPS,
         help=(
-            "Gaussian blur sigma for noise in grid cells (0 = white noise; "
-            "3--6 = mildly smooth irregular bumps)"
+            "Number of noisy Gaussian bumps/dips per noisy instance "
+            f"(default: {DEFAULT_N_NOISE_BUMPS})"
         ),
     )
     parser.add_argument(
-        "--noise-height-power",
+        "--noise-bump-height-min",
         type=float,
-        default=NOISE_HEIGHT_POWER,
-        help=(
-            "Weight noise by (1 - height)^power so the center peak is barely "
-            "perturbed; increase for stronger periphery emphasis"
-        ),
+        default=NOISE_BUMP_HEIGHT_MIN,
+        help="Minimum |peak| magnitude of each noisy bump/dip (normalized units)",
+    )
+    parser.add_argument(
+        "--noise-bump-height-max",
+        type=float,
+        default=NOISE_BUMP_HEIGHT_MAX,
+        help="Maximum |peak| magnitude of each noisy bump/dip",
+    )
+    parser.add_argument(
+        "--noise-bump-dip-prob",
+        type=float,
+        default=NOISE_BUMP_DIP_PROB,
+        help="Probability that a feature is a dip rather than a bump (default: 0.5)",
+    )
+    parser.add_argument(
+        "--noise-bump-sigma-min",
+        type=float,
+        default=NOISE_BUMP_SIGMA_MIN,
+        help=f"Minimum spatial sigma (domain units; regular bump sigma={BUMP_SIGMA})",
+    )
+    parser.add_argument(
+        "--noise-bump-sigma-max",
+        type=float,
+        default=NOISE_BUMP_SIGMA_MAX,
+        help=f"Maximum spatial sigma (must be < regular BUMP_SIGMA={BUMP_SIGMA})",
+    )
+    parser.add_argument(
+        "--noise-bump-margin",
+        type=float,
+        default=NOISE_BUMP_MARGIN,
+        help="Keep noisy feature centers at least this far from the domain edge",
+    )
+    parser.add_argument(
+        "--noise-bump-min-separation",
+        type=float,
+        default=NOISE_BUMP_MIN_SEPARATION,
+        help="Minimum distance between noisy feature centers",
     )
     parser.add_argument(
         "--peak-inset",
@@ -340,7 +481,7 @@ def parse_args() -> argparse.Namespace:
         action=argparse.BooleanOptionalAction,
         default=NOISE_REGION_RESTRICT,
         help=(
-            "Limit noise to x <= MAX_X/2 and y <= MAX_Y/2 "
+            "Place noisy features only in x <= MAX_X/2 and y <= MAX_Y/2 "
             "(default: on; use --no-restrict-noise-region to disable)"
         ),
     )
@@ -355,14 +496,30 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
+    if args.n_bumps < 0:
+        raise SystemExit(f"--n-bumps must be >= 0, got {args.n_bumps}")
+    if args.noise_bump_height_min <= 0.0:
+        raise SystemExit("--noise-bump-height-min must be > 0 (feature magnitude)")
+    if not (0.0 <= args.noise_bump_dip_prob <= 1.0):
+        raise SystemExit("--noise-bump-dip-prob must be in [0, 1]")
+    if args.noise_bump_sigma_max >= BUMP_SIGMA:
+        raise SystemExit(
+            f"--noise-bump-sigma-max must be < regular BUMP_SIGMA={BUMP_SIGMA}"
+        )
+
     paths = generate_instances(
         output_dir=args.output_dir,
         nx=args.nx,
         ny=args.ny,
         n_noisy=args.n_noisy,
-        noise_std=args.noise_std,
-        noise_smooth_sigma_cells=args.noise_smooth_sigma_cells,
-        noise_height_power=args.noise_height_power,
+        n_bumps=args.n_bumps,
+        noise_bump_height_min=args.noise_bump_height_min,
+        noise_bump_height_max=args.noise_bump_height_max,
+        noise_bump_sigma_min=args.noise_bump_sigma_min,
+        noise_bump_sigma_max=args.noise_bump_sigma_max,
+        noise_bump_margin=args.noise_bump_margin,
+        noise_bump_min_separation=args.noise_bump_min_separation,
+        noise_bump_dip_prob=args.noise_bump_dip_prob,
         peak_inset=args.peak_inset,
         seed=args.seed,
         scalar_name=args.scalar_name,

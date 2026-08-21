@@ -1,5 +1,9 @@
 # Large dataset — keep local only
 data/VortexStreet/
+data/synthetic/deprecated_large_noise/
+
+# Generated barycenter run artifacts (keep README/.gitkeep)
+results/barycenters/*/
 
 # Python / Jupyter
 __pycache__/

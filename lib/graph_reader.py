@@ -2,11 +2,13 @@
 Functions for reading and processing Morse graphs from files.
 """
 
+import heapq
+import itertools
 import os
 import warnings
 import numpy as np
 import networkx as nx
-from typing import List, Literal, Optional, Tuple, TYPE_CHECKING
+from typing import Any, Dict, List, Literal, Optional, Sequence, Tuple, TYPE_CHECKING
 
 SampleMode = Literal["step", "geo"]
 
@@ -207,6 +209,10 @@ def read_morse_graph_txt(
 ) -> Tuple[nx.Graph, List[int]]:
     """
     Read a Morse graph from text files.
+
+    Edge files may list the same undirected edge more than once with different
+    separatrix IDs. Those IDs are merged into edge attribute ``separatrixID`` as
+    a sorted comma-separated string (e.g. ``"0,1,6,7"``).
     
     Parameters
     ----------
@@ -241,11 +247,14 @@ def read_morse_graph_txt(
     if edges_data.ndim == 1:
         edges_data = edges_data.reshape(1, -1)
 
-    seen_edges = set()
+    # Accumulate undirected edges; duplicate geometric edges may list several
+    # separatrix IDs that we merge into one comma-separated property.
+    edge_accum: dict = {}
     for edge in edges_data:
         u_orig = int(edge[0])
         v_orig = int(edge[1])
         edge_type = int(edge[2]) if len(edge) > 2 else 0
+        edge_separatrix_id = int(edge[3]) if len(edge) > 3 else 0
 
         u = orig_to_canon[u_orig]
         v = orig_to_canon[v_orig]
@@ -253,23 +262,86 @@ def read_morse_graph_txt(
             continue
 
         edge_key = (min(u, v), max(u, v))
-        if edge_key in seen_edges:
-            continue
-        seen_edges.add(edge_key)
+        if edge_key not in edge_accum:
+            edge_accum[edge_key] = {"type": edge_type, "ids": {edge_separatrix_id}}
+        else:
+            edge_accum[edge_key]["ids"].add(edge_separatrix_id)
 
+    for (u, v), info in edge_accum.items():
         dist = float(
             np.linalg.norm(
                 np.asarray([T.nodes[u]["x"], T.nodes[u]["y"], T.nodes[u]["z"]])
                 - np.asarray([T.nodes[v]["x"], T.nodes[v]["y"], T.nodes[v]["z"]])
             )
         )
-        T.add_edge(u, v, weight=dist, type=edge_type)
+        T.add_edge(
+            u,
+            v,
+            weight=dist,
+            type=info["type"],
+            separatrixID=format_edge_separatrix_ids(info["ids"]),
+        )
 
     return T, critical_nodes
 
 
+def format_edge_separatrix_ids(ids) -> str:
+    """Encode edge separatrix IDs as a sorted comma-separated string."""
+    return ",".join(str(i) for i in sorted({int(x) for x in ids}))
+
+
+def edge_separatrix_id_key(data: Optional[dict]) -> str:
+    """
+    Canonical ``separatrixID`` string for an edge attribute dict.
+
+    Accepts the stored comma-separated form, a single int, or an iterable of ids.
+    Missing values default to ``"-1"``.
+    """
+    if not data or "separatrixID" not in data:
+        return "-1"
+    raw = data["separatrixID"]
+    if isinstance(raw, str):
+        parts = [p.strip() for p in raw.split(",") if p.strip() != ""]
+        if not parts:
+            return "-1"
+        return format_edge_separatrix_ids(parts)
+    if isinstance(raw, (int, np.integer)):
+        return str(int(raw))
+    try:
+        return format_edge_separatrix_ids(raw)
+    except TypeError:
+        return str(raw)
+
+
 def _node_xyz(G: nx.Graph, n) -> np.ndarray:
     return np.asarray([G.nodes[n]["x"], G.nodes[n]["y"], G.nodes[n]["z"]], dtype=float)
+
+
+def _edge_euclid(G: nx.Graph, a, b) -> float:
+    return float(np.linalg.norm(_node_xyz(G, a) - _node_xyz(G, b)))
+
+
+def _polyline_arc_length(G: nx.Graph, path: Sequence) -> float:
+    """Sum of 3D Euclidean hops along ``path`` using coordinates in ``G``."""
+    total = 0.0
+    for a, b in zip(path[:-1], path[1:]):
+        total += _edge_euclid(G, a, b)
+    return total
+
+
+def _oriented_path_nodes(u, v, path: Optional[Sequence]) -> List:
+    """Return ``path`` oriented from ``u`` to ``v`` when possible."""
+    if path is None:
+        return [u, v]
+    nodes = list(path)
+    if len(nodes) < 2:
+        return [u, v]
+    if nodes[0] == u and nodes[-1] == v:
+        return nodes
+    if nodes[0] == v and nodes[-1] == u:
+        nodes.reverse()
+        return nodes
+    return nodes
 
 
 def _edge_matches_type(G: nx.Graph, u, v, edge_type: int) -> bool:
@@ -304,6 +376,18 @@ def sample_morse_graph(
     are kept only when path spacing exceeds ``rate``. Edges connect consecutive
     kept nodes along each path (no self-loops).
 
+    Within one walk, only hops that share the same edge ``separatrixID`` string
+    (merged set of IDs) are traversed, so sampling never concatenates segments
+    from different separatrices. Nodes incident to more than one distinct
+    ``separatrixID`` are treated as junctions (always kept). Shortcut edges
+    inherit the path ``separatrixID``.
+
+    Each sampled edge stores the original walk as ``path_nodes`` (endpoint
+    ids included) and the polyline length as ``arc_length``. ``weight`` remains
+    the 3D Euclidean chord between the kept endpoints (used by shortest-path
+    ``C``). Dropped interior nodes can later be reinserted by
+    :func:`expand_sampled_graph_to_size`.
+
     Returns
     -------
     G_sample : nx.Graph
@@ -318,32 +402,58 @@ def sample_morse_graph(
     junction_set = {
         n for n in G.nodes() if G.degree(n) >= preserve_min_degree
     }
+    # Nodes where incident edges disagree on separatrixID are natural segment
+    # seams: always keep them so sampling cannot skip across SID changes.
+    for n in G.nodes():
+        sids = {
+            edge_separatrix_id_key(G.get_edge_data(n, m))
+            for m in G.neighbors(n)
+        }
+        if len(sids) > 1:
+            junction_set.add(n)
     anchor_set = critical_set | junction_set
     G_sample = nx.Graph()
     visited = set()
 
     def _euclid(a, b) -> float:
-        return float(np.linalg.norm(_node_xyz(G, a) - _node_xyz(G, b)))
+        return _edge_euclid(G, a, b)
 
     def _add_node(n):
         if not G_sample.has_node(n):
             G_sample.add_node(n, **G.nodes[n])
 
-    def _add_edge(a, b, edge_type: int):
+    def _add_edge(a, b, edge_type: int, separatrix_id: str, path_nodes: Sequence):
         if a == b:
             return
+        path_nodes = list(path_nodes)
+        if len(path_nodes) < 2:
+            path_nodes = [a, b]
         _add_node(a)
         _add_node(b)
-        G_sample.add_edge(a, b, weight=_euclid(a, b), type=edge_type)
+        arc_length = _polyline_arc_length(G, path_nodes)
+        if G_sample.has_edge(a, b):
+            old_path = G_sample[a][b].get("path_nodes") or []
+            if len(path_nodes) <= len(old_path):
+                return
+        G_sample.add_edge(
+            a,
+            b,
+            weight=_euclid(a, b),
+            arc_length=arc_length,
+            path_nodes=path_nodes,
+            type=edge_type,
+            separatrixID=separatrix_id,
+        )
 
     def dfs(start, edge_type: int = 0):
         if start in visited and start not in critical_set:
             return
 
-        stack = [(start, start, 0.0)]
+        # (path_start, node, length, path_separatrix_id or None, path_nodes)
+        stack = [(start, start, 0.0, None, [start])]
 
         while stack:
-            start, node, length = stack.pop()
+            start, node, length, path_sid, path = stack.pop()
 
             if node in visited and node not in critical_set:
                 continue
@@ -356,11 +466,17 @@ def sample_morse_graph(
                 if not _edge_matches_type(G, node, n, edge_type):
                     continue
 
+                hop_sid = edge_separatrix_id_key(G.get_edge_data(node, n))
+                if path_sid is not None and hop_sid != path_sid:
+                    continue
+                next_sid = hop_sid if path_sid is None else path_sid
+                new_path = path + [n]
+
                 if n in anchor_set:
-                    _add_edge(start, n, edge_type)
+                    _add_edge(start, n, edge_type, next_sid, new_path)
                     # Junctions (non-critical) must fan out into their other branches.
                     if n in junction_set and n not in critical_set:
-                        stack.append((n, n, 0.0))
+                        stack.append((n, n, 0.0, None, [n]))
                     continue
 
                 if mode == "step":
@@ -369,10 +485,10 @@ def sample_morse_graph(
                     new_length = length + _euclid(node, n)
 
                 if new_length > rate:
-                    _add_edge(start, n, edge_type)
-                    stack.append((n, n, 0.0))
+                    _add_edge(start, n, edge_type, next_sid, new_path)
+                    stack.append((n, n, 0.0, None, [n]))
                 else:
-                    stack.append((start, n, new_length))
+                    stack.append((start, n, new_length, next_sid, new_path))
 
     for crit in critical_set:
         _add_node(crit)
@@ -393,6 +509,212 @@ def sample_morse_graph(
 
     critical_out = [n for n in critical_set if G_sample.has_node(n)]
     return G_sample, critical_out
+
+
+def _recover_dropped_path(
+    source_graph: nx.Graph,
+    G_sample: nx.Graph,
+    u,
+    v,
+) -> List:
+    """
+    Reconstruct interior nodes dropped between ``u`` and ``v``.
+
+    Restricts to dropped nodes plus the two endpoints so the recovered walk
+    does not pass through other kept sample nodes.
+    """
+    present = set(G_sample.nodes())
+    allowed = (set(source_graph.nodes()) - present) | {u, v}
+    H = source_graph.subgraph(allowed)
+    try:
+        return list(nx.shortest_path(H, u, v))
+    except (nx.NetworkXNoPath, nx.NodeNotFound):
+        return [u, v]
+
+
+def _edge_path_nodes(
+    G: nx.Graph,
+    source_graph: nx.Graph,
+    u,
+    v,
+    data: Optional[dict] = None,
+) -> List:
+    """Path of original nodes along sampled edge ``(u, v)``."""
+    if data is None:
+        data = G.get_edge_data(u, v) or {}
+    stored = data.get("path_nodes")
+    path = _oriented_path_nodes(u, v, stored)
+    if len(path) >= 2 and path[0] == u and path[-1] == v:
+        return path
+    return _recover_dropped_path(source_graph, G, u, v)
+
+
+def _choose_split_node(
+    source_graph: nx.Graph,
+    path: Sequence,
+    present: set,
+):
+    """
+    Dropped node on ``path`` closest to the arc-length midpoint.
+
+    Returns ``None`` when the edge has no remaining insertable node.
+    """
+    if len(path) < 3:
+        return None
+    interior = [n for n in path[1:-1] if n not in present and n in source_graph]
+    if not interior:
+        return None
+
+    cum = [0.0]
+    for a, b in zip(path[:-1], path[1:]):
+        cum.append(cum[-1] + _edge_euclid(source_graph, a, b))
+    total = cum[-1]
+    index_of = {n: i for i, n in enumerate(path)}
+    if total <= 0.0:
+        target_idx = 0.5 * (len(path) - 1)
+        return min(interior, key=lambda n: abs(index_of[n] - target_idx))
+
+    target = 0.5 * total
+    best = None
+    best_dist = None
+    for n in interior:
+        dist = abs(cum[index_of[n]] - target)
+        if best is None or dist < best_dist:
+            best = n
+            best_dist = dist
+    return best
+
+
+def expand_sampled_graph_to_size(
+    G_sample: nx.Graph,
+    n_target: int,
+    source_graph: nx.Graph,
+) -> Tuple[nx.Graph, Dict[str, Any]]:
+    """
+    Grow a subsampled MSC graph by reinserting dropped original nodes.
+
+    This does **not** modify ``G_sample``. The input barycenter graphs should
+    stay at their subsampled size; only the returned copy is expanded (used
+    as the barycenter initialization / seed network).
+
+    Algorithm
+    ---------
+    1. Push every current edge's polyline arc length onto a max-heap.
+    2. Pop the longest edge. Among original nodes that were dropped on that
+       edge, insert the one closest to cutting the polyline in half.
+    3. If the edge has no remaining dropped node, skip it (do not re-push).
+    4. Replace the split edge by the two sub-edges and push their lengths.
+    5. Repeat until the graph has ``n_target`` nodes, or no splittable edge
+       remains.
+
+    Parameters
+    ----------
+    G_sample : nx.Graph
+        Subsampled Morse graph (typically from :func:`sample_morse_graph`).
+    n_target : int
+        Desired node count (``N_max`` of the barycenter pipeline).
+    source_graph : nx.Graph
+        Graph before subsampling, with the original node attributes and the
+        nodes that were dropped. Node ids must match ``G_sample``.
+
+    Returns
+    -------
+    G_expanded : nx.Graph
+        Copy of ``G_sample`` with dropped nodes reinserted.
+    info : dict
+        Diagnostics: ``n_inserted``, ``n_skipped_edges``, ``n_target``,
+        ``n_start``, ``n_end``, ``inserted_nodes``.
+    """
+    G = G_sample.copy()
+    info: Dict[str, Any] = {
+        "n_start": int(G.number_of_nodes()),
+        "n_target": int(n_target),
+        "n_inserted": 0,
+        "n_skipped_edges": 0,
+        "inserted_nodes": [],
+    }
+    if n_target <= G.number_of_nodes():
+        info["n_end"] = int(G.number_of_nodes())
+        return G, info
+
+    counter = itertools.count()
+    heap: List[Tuple[float, int, Tuple]] = []
+
+    def _push_edge(path: Sequence) -> None:
+        if len(path) < 2:
+            return
+        length = _polyline_arc_length(source_graph, path)
+        heapq.heappush(heap, (-float(length), next(counter), tuple(path)))
+
+    for u, v, data in G.edges(data=True):
+        _push_edge(_edge_path_nodes(G, source_graph, u, v, data))
+
+    while G.number_of_nodes() < n_target and heap:
+        _neg_len, _tick, path_t = heapq.heappop(heap)
+        path = list(path_t)
+        u, v = path[0], path[-1]
+        data = G.get_edge_data(u, v)
+        if data is None:
+            continue
+        current_path = _edge_path_nodes(G, source_graph, u, v, data)
+        if tuple(current_path) != tuple(path) and tuple(reversed(current_path)) != tuple(path):
+            continue
+        if tuple(reversed(current_path)) == tuple(path):
+            path = current_path
+
+        present = set(G.nodes())
+        w = _choose_split_node(source_graph, path, present)
+        if w is None:
+            info["n_skipped_edges"] += 1
+            continue
+        if w not in source_graph:
+            info["n_skipped_edges"] += 1
+            continue
+
+        try:
+            split_at = path.index(w)
+        except ValueError:
+            info["n_skipped_edges"] += 1
+            continue
+        left = path[: split_at + 1]
+        right = path[split_at:]
+        if len(left) < 2 or len(right) < 2:
+            info["n_skipped_edges"] += 1
+            continue
+
+        G.add_node(w, **dict(source_graph.nodes[w]))
+        edge_type = data.get("type", 0)
+        separatrix_id = data.get("separatrixID")
+        G.remove_edge(u, v)
+
+        def _add_split_edge(a, b, subpath: List) -> None:
+            attrs = {
+                "weight": _edge_euclid(G, a, b),
+                "arc_length": _polyline_arc_length(source_graph, subpath),
+                "path_nodes": list(subpath),
+            }
+            if edge_type is not None:
+                attrs["type"] = edge_type
+            if separatrix_id is not None:
+                attrs["separatrixID"] = separatrix_id
+            G.add_edge(a, b, **attrs)
+
+        _add_split_edge(u, w, left)
+        _add_split_edge(w, v, right)
+        _push_edge(left)
+        _push_edge(right)
+        info["n_inserted"] += 1
+        info["inserted_nodes"].append(w)
+
+    info["n_end"] = int(G.number_of_nodes())
+    if G.number_of_nodes() < n_target:
+        warnings.warn(
+            "expand_sampled_graph_to_size reached "
+            f"{G.number_of_nodes()} nodes (target {n_target}); "
+            "no remaining dropped node could be inserted on a seed edge.",
+            stacklevel=2,
+        )
+    return G, info
 
 
 def summarize_graph_connectivity(
@@ -612,11 +934,24 @@ from lib.msc_barycenter_reconstruction import (  # noqa: E402
 )
 from lib.msc_plotting import (  # noqa: E402
     MSC_TYPE_COLORS,
+    barycenter_xy_positions,
+    draw_barycenter_colormap,
+    draw_barycenter_thresholded_complete,
+    draw_msc_barycenter_graph,
+    draw_msc_graphs_overlay,
     draw_msc_nodes,
+    draw_processed_msc_graphs,
     msc_node_visual_type,
     msc_type_color,
+    msc_xy_positions,
     node_height,
     plot_msc_barycenter_weight_euclidean_debug,
+    set_barycenter_axes_limits,
+)
+from lib.msc_barycenter_threshold import (  # noqa: E402
+    build_complete_barycenter_graph,
+    build_thresholded_barycenter_graph,
+    thresholded_barycenter_edge_candidates,
 )
 
 __all__ = [
@@ -626,15 +961,27 @@ __all__ = [
     "MSC_TYPE_COLORS",
     "apply_combined_relation",
     "apply_relation_scaling",
+    "barycenter_xy_positions",
+    "build_complete_barycenter_graph",
+    "build_thresholded_barycenter_graph",
     "combined_relation_target_distances",
     "compute_relation_rescale",
+    "draw_barycenter_colormap",
+    "draw_barycenter_thresholded_complete",
+    "draw_msc_barycenter_graph",
+    "draw_msc_graphs_overlay",
     "draw_msc_nodes",
+    "draw_processed_msc_graphs",
+    "edge_separatrix_id_key",
+    "expand_sampled_graph_to_size",
+    "format_edge_separatrix_ids",
     "load_morse_graphs",
     "merge_duplicate_nodes",
     "msc_barycenter_weight_euclidean_debug",
     "msc_barycenter_weight_euclidean_differences",
     "msc_node_visual_type",
     "msc_type_color",
+    "msc_xy_positions",
     "node_height",
     "plot_msc_barycenter_weight_euclidean_debug",
     "prepare_graph_for_barycenter",
@@ -643,6 +990,8 @@ __all__ = [
     "reconstruct_msc_barycenter_mst_graph",
     "relation_matrix",
     "sample_morse_graph",
+    "set_barycenter_axes_limits",
     "summarize_graph_connectivity",
+    "thresholded_barycenter_edge_candidates",
     "verify_msc_barycenter_reconstruction",
 ]

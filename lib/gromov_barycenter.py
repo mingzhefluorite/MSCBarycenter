@@ -796,11 +796,9 @@ def pfgw_barycenters(
                     numItermax_gw=max_iter, tol=1e-5, log=False, verbose=verbose,
                     seed=gw_seed_start, **gw_kwargs)
                 
-                T_best_diff = np.max(T_best) - np.min(T_best)
+                T_best_diff = abs(np.max(T_best) - np.min(T_best))
                 if T_best_diff < np.sum(ps[s]) / (T_best.shape[0] * T_best.shape[1]):
                     fails += 1
-                    if fails > accumulate_fails_limit:
-                        break
             else:
                 T_best, best_cost = None, None
                 for r in range(gw_restarts):
@@ -816,11 +814,9 @@ def pfgw_barycenters(
                         best_cost = cost
                         T_best = T
                 
-                T_best_diff = np.max(T_best) - np.min(T_best)
+                T_best_diff = abs(np.max(T_best) - np.min(T_best))
                 if T_best_diff < np.sum(ps[s]) / (T_best.shape[0] * T_best.shape[1]):
                     fails += 1
-                    if fails > accumulate_fails_limit:
-                        break
             res.append(T_best)
 
         T = res

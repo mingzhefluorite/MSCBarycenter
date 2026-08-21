@@ -7,6 +7,7 @@ import networkx as nx
 from typing import List, Optional, Sequence, Tuple
 
 from lib.graph_relations import combined_relation_target_distances
+from lib.graph_sparsify import count_edge_crossings_2d
 
 
 class _UnionFind:
@@ -80,6 +81,11 @@ def reconstruct_msc_barycenter_mst_graph(
 ) -> nx.Graph:
     """
     Reconstruct an MSC barycenter graph from FGW outputs via a Kruskal MST.
+
+    Candidates are considered in increasing weight order. An edge is added only
+    if it connects different components and does not properly intersect (in the
+    (x, y) plane) any edge already accepted. Shared endpoints are not treated as
+    intersections. Skipping crossings can leave a forest rather than a tree.
 
     Edge structure depends only on ``C_center``. ``X_center`` supplies node
     coordinates in columns 0–2; optional scalar and Morse-type blocks are
@@ -159,11 +165,20 @@ def reconstruct_msc_barycenter_mst_graph(
         C, relation_kind=relation_kind, edge_threshold=edge_threshold
     )
 
+    pos = {
+        i: np.array([G.nodes[i]["x"], G.nodes[i]["y"]], dtype=float)
+        for i in range(n)
+    }
+    accepted_edges: List[Tuple[int, int]] = []
     uf = _UnionFind(n)
     for w, u, v in candidates:
-        if uf.find(u) != uf.find(v):
-            uf.union(u, v)
-            G.add_edge(u, v, weight=w, edge_pass="mst", artifact_alarm=False)
+        if uf.find(u) == uf.find(v):
+            continue
+        if count_edge_crossings_2d((u, v), accepted_edges, pos) > 0:
+            continue
+        uf.union(u, v)
+        G.add_edge(u, v, weight=w, edge_pass="mst", artifact_alarm=False)
+        accepted_edges.append((u, v))
 
     G.graph["relation_kind"] = relation_kind
     G.graph["relation_rescale"] = float(relation_rescale)

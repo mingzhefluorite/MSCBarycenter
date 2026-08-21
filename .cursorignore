@@ -3,3 +3,7 @@
 *.vtp
 *.vtk
 *.csv
+msc_barycenter_reconstruction_backup.ipynb
+msc_barycenter_adjacency.ipynb
+msc_barycenter_reconstruction_sol5.6.ipynb
+graph_barycenter_adjacency.ipynb
