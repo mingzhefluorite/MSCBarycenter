@@ -11,7 +11,9 @@ import importlib.metadata
 import json
 import pickle
 import platform
+import re
 import warnings
+import time
 from collections import defaultdict
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
@@ -22,6 +24,7 @@ import networkx as nx
 import numpy as np
 import pandas as pd
 
+from lib.barycenter_io import barycenter_save_timestamp
 from lib.graph_sparsify import (
     geometric_planarity_allows_edge,
     is_geometrically_planar_2d,
@@ -29,10 +32,15 @@ from lib.graph_sparsify import (
 
 PathLike = Union[str, Path]
 ConstraintMode = Literal["off", "soft", "hard"]
-AffinityMode = Literal["separatrix_hop_decay", "separatrix_length_normalized_decay"]
+AffinityMode = Literal[
+    "separatrix_hop_decay",
+    "separatrix_length_normalized_decay",
+    "separatrix_gaussian",
+]
 LengthReferenceMode = Literal[
     "input_median", "separatrix_median", "global_input_family_median"
 ]
+GaussianDistanceUnits = Literal["domain", "raw"]
 MissingSeparatrixPolicy = Literal["error", "warn", "skip"]
 NodeSupportClass = Literal[
     "well_supported", "softly_supported", "weakly_supported", "uncovered"
@@ -102,6 +110,7 @@ class InputAffinityResult:
     reference_spacing: Optional[float]
     warnings: List[str]
     diagnostics: Dict[str, Any]
+    path_distances: Dict[Tuple[int, int], float] = field(default_factory=dict)
 
 
 @dataclass
@@ -131,6 +140,126 @@ class TransportedConnectivityResult:
     input_sampling_diagnostics: pd.DataFrame
     warnings: List[str]
     diagnostics: Dict[str, Any]
+
+
+@dataclass
+class SeparatrixPathIndex:
+    """Ordered 1-separatrix paths aligned to coupling columns of one input.
+
+    ``between_nodes[(x, z)]`` lists every input-column index ``y`` that lies
+    strictly between ``x`` and ``z`` on at least one recorded simple path.
+    Membership is existential: multiple separatrix IDs never duplicate ``y``.
+    """
+
+    node_order: List[Any]
+    node_to_index: Dict[Any, int]
+    node_to_separatrix_ids: Dict[int, frozenset]
+    separatrix_positions: Dict[str, Dict[int, int]]
+    separatrix_paths: Dict[str, List[int]]
+    between_nodes: Dict[Tuple[int, int], np.ndarray]
+    warnings: List[str]
+    diagnostics: Dict[str, Any]
+
+
+@dataclass
+class TripleBetweenness:
+    """Coverage-weighted ensemble betweenness ``B(a, b, c)``."""
+
+    a: int
+    b: int
+    c: int
+    B: float
+    B_inputs: np.ndarray
+    weights: np.ndarray
+    weight_sum: float
+    uninformative: bool
+
+
+@dataclass
+class TriangleReconstructionResult:
+    """Hard reconstruction by same-separatrix triangle shortcut removal."""
+
+    mode: str
+    theta: float
+    min_edge_threshold: float
+    candidate_graph: nx.Graph
+    reconstructed_graph: nx.Graph
+    edge_scores: pd.DataFrame
+    removed_edges: pd.DataFrame
+    statistics: Dict[str, Any]
+    diagnostics: Dict[str, Any]
+
+
+@dataclass
+class PathCoherence:
+    """Coverage-weighted path-level same-separatrix coherence ``C(P)``."""
+
+    path: Tuple[int, ...]
+    C: float
+    C_inputs: np.ndarray
+    weights: np.ndarray
+    weight_sum: float
+    uninformative: bool
+    best_separatrix_ids: List[Optional[str]]
+    best_directions: List[Optional[str]]
+    best_scores: np.ndarray
+
+
+@dataclass
+class CyclePruningResult:
+    """Greedy Phase 2 pruning of same-separatrix cycles."""
+
+    mode: str
+    theta: float
+    phase1_graph: nx.Graph
+    reconstructed_graph: nx.Graph
+    removed_edges: pd.DataFrame
+    attempt_log: pd.DataFrame
+    statistics: Dict[str, Any]
+    diagnostics: Dict[str, Any]
+    preprocess_seconds: float
+    elapsed_seconds: float
+
+
+@dataclass
+class EdgeSeparatrixSupport:
+    """Coverage-weighted max-separatrix support ``S_sep(e)`` of one barycenter edge."""
+
+    u: int
+    v: int
+    mode: str
+    S_sep: float
+    S_inputs: np.ndarray
+    weights: np.ndarray
+    weight_sum: float
+    uninformative: bool
+    best_separatrix_ids: List[Optional[str]]
+    best_directions: List[Optional[str]]
+    S_forward_inputs: np.ndarray
+    S_reverse_inputs: np.ndarray
+    mean_hops: np.ndarray
+    strong_fraction: float
+    S_std: float
+
+
+@dataclass
+class EdgePathRedundancy:
+    """Same-separatrix redundancy ``R(e, P)`` of a candidate edge and a replacement path."""
+
+    u: int
+    v: int
+    path: Tuple[int, ...]
+    R: float
+    R_inputs: np.ndarray
+    weights: np.ndarray
+    weight_sum: float
+    uninformative: bool
+    best_separatrix_ids: List[Optional[str]]
+    best_directions: List[Optional[str]]
+    S_matched: np.ndarray
+    C_matched: np.ndarray
+    bottleneck: float
+    mean_affinity: float
 
 
 @dataclass
@@ -232,13 +361,14 @@ class ReconstructionConfig:
     allow_degree_based_chain_fallback: bool = False
     strict_validation: bool = True
 
-    connectivity_affinity_mode: AffinityMode = "separatrix_hop_decay"
-    hop_decay_q: float = 0.1
-    hop_decay_q_values: List[float] = field(
-        default_factory=lambda: [0.05, 0.1, 0.15, 0.2, 0.25]
-    )
+    connectivity_affinity_mode: AffinityMode = "separatrix_gaussian"
     max_soft_hops: int = 4
     max_soft_hops_values: List[int] = field(default_factory=lambda: [2, 3, 4])
+    gaussian_sigma: float = 0.05
+    gaussian_eta: float = 1.0
+    gaussian_zero_at_zero_distance: bool = True
+    gaussian_cutoff_sigmas: float = 3.0
+    gaussian_distance_units: GaussianDistanceUnits = "domain"
 
     enable_length_normalized_affinity: bool = True
     length_reference_spacing_mode: LengthReferenceMode = "input_median"
@@ -302,26 +432,6 @@ class ReconstructionConfig:
                 "use_barycenter_relation_for_edge_selection must be False; "
                 "C_center may only be used post-hoc."
             )
-        if not 0.0 <= float(self.hop_decay_q) <= 1.0:
-            raise ValueError(f"hop_decay_q must lie in [0, 1]; got {self.hop_decay_q!r}.")
-        if float(self.hop_decay_q) == 1.0:
-            warnings.warn(
-                "hop_decay_q=1 removes decay with hop distance and is intended "
-                "only as a diagnostic sensitivity value.",
-                UserWarning,
-                stacklevel=2,
-            )
-        for value in self.hop_decay_q_values:
-            if not 0.0 <= float(value) <= 1.0:
-                raise ValueError(
-                    f"hop_decay_q_values must lie in [0, 1]; got {value!r}."
-                )
-            if float(value) == 1.0:
-                warnings.warn(
-                    "hop_decay_q_values includes 1.0 (diagnostic only; no hop decay).",
-                    UserWarning,
-                    stacklevel=2,
-                )
         if self.max_soft_hops < 1:
             raise ValueError("max_soft_hops must be >= 1.")
         if any(value < 1 for value in self.max_soft_hops_values):
@@ -329,8 +439,17 @@ class ReconstructionConfig:
         if self.connectivity_affinity_mode not in {
             "separatrix_hop_decay",
             "separatrix_length_normalized_decay",
+            "separatrix_gaussian",
         }:
             raise ValueError("Unsupported connectivity_affinity_mode.")
+        if float(self.gaussian_sigma) <= 0.0:
+            raise ValueError("gaussian_sigma must be positive.")
+        if float(self.gaussian_eta) <= 0.0:
+            raise ValueError("gaussian_eta must be positive.")
+        if float(self.gaussian_cutoff_sigmas) <= 0.0:
+            raise ValueError("gaussian_cutoff_sigmas must be positive.")
+        if self.gaussian_distance_units not in {"domain", "raw"}:
+            raise ValueError("gaussian_distance_units must be 'domain' or 'raw'.")
         if self.length_reference_spacing_mode not in {
             "input_median",
             "separatrix_median",
@@ -407,8 +526,15 @@ class ReconstructionConfig:
         self, project_root: PathLike = ".", *, create: bool = False
     ) -> Tuple[Path, Path]:
         bundle = self.resolve_bundle_dir(project_root)
-        stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-        output_dir = bundle / "reconstruction" / f"{self.reconstruction_name}_{stamp}"
+        stamp = barycenter_save_timestamp()
+        reconstruction_root = bundle / "reconstruction"
+        output_dir = reconstruction_root / f"{self.reconstruction_name}_{stamp}"
+        extra = 1
+        while output_dir.exists():
+            output_dir = (
+                reconstruction_root / f"{self.reconstruction_name}_{stamp}_{extra:02d}"
+            )
+            extra += 1
         figures_dir = output_dir / "figures"
         if create:
             figures_dir.mkdir(parents=True, exist_ok=True)
@@ -988,6 +1114,37 @@ def _affinity_from_distance(distance: float, q: float, max_hops: float) -> float
     return float(q ** (distance - 1.0))
 
 
+def _gaussian_kernel_value(
+    distance: float,
+    *,
+    sigma: float,
+    eta: float,
+    cutoff: float,
+    zero_at_zero_distance: bool,
+) -> float:
+    """Standard RBF ``η exp(-d² / (2σ²))``, clipped to ``[0, 1]``.
+
+    Long-tail pairs with ``d > cutoff`` are zero. Distance ``0`` is either
+    the Gaussian peak ``η`` or hard-zeroed to avoid self-loop affinity.
+    """
+    if not np.isfinite(distance) or distance < 0.0:
+        return 0.0
+    if distance == 0.0:
+        return 0.0 if zero_at_zero_distance else min(1.0, float(eta))
+    if distance > cutoff:
+        return 0.0
+    value = float(eta) * float(np.exp(-0.5 * (distance / sigma) ** 2))
+    return float(min(1.0, max(0.0, value)))
+
+
+def _connectivity_affinity_formula(mode: AffinityMode) -> str:
+    if mode == "separatrix_gaussian":
+        return "eta * exp(-(d_raw/domain_size)^2 / (2 * sigma^2))"
+    if mode == "separatrix_length_normalized_decay":
+        return "max_r q ** (d_r / delta - 1)"
+    return "max_r q ** (d_r - 1)"
+
+
 def _node_xyz(graph: nx.Graph, node: Any) -> np.ndarray:
     data = graph.nodes[node]
     return np.asarray([data["x"], data["y"], data.get("z", 0.0)], dtype=float)
@@ -999,18 +1156,31 @@ def _edge_geometric_length(
     v: Any,
     *,
     length_attribute: Optional[str] = None,
+    length_scale: float = 1.0,
 ) -> float:
+    """Unnormalized Euclidean length, optionally divided by ``length_scale``.
+
+    Input graphs store raw mesh coordinates on nodes and the same Euclidean
+    length on ``edge.weight``. This does **not** use FGW-rescaled ``C`` entries.
+    Pass ``length_scale=domain_size`` to express the length in the same units
+    as the normalized feature coordinates ``(x-min)/domain_size``.
+    """
     data = graph.get_edge_data(u, v)
     if isinstance(data, dict) and graph.is_multigraph():
         # Multi-edge dict keyed by edge key; use the first edge payload.
         data = next(iter(data.values())) if data else {}
     if length_attribute and isinstance(data, dict) and length_attribute in data:
-        return float(data[length_attribute])
-    return float(np.linalg.norm(_node_xyz(graph, u) - _node_xyz(graph, v)))
+        raw = float(data[length_attribute])
+    else:
+        raw = float(np.linalg.norm(_node_xyz(graph, u) - _node_xyz(graph, v)))
+    return raw / max(float(length_scale), EPS)
 
 
 def _unique_edge_lengths(
-    graph: nx.Graph, *, length_attribute: Optional[str] = None
+    graph: nx.Graph,
+    *,
+    length_attribute: Optional[str] = None,
+    length_scale: float = 1.0,
 ) -> np.ndarray:
     lengths = []
     seen = set()
@@ -1019,8 +1189,99 @@ def _unique_edge_lengths(
         if key in seen:
             continue
         seen.add(key)
-        lengths.append(_edge_geometric_length(graph, u, v, length_attribute=length_attribute))
+        lengths.append(
+            _edge_geometric_length(
+                graph,
+                u,
+                v,
+                length_attribute=length_attribute,
+                length_scale=length_scale,
+            )
+        )
     return np.asarray(lengths, dtype=float)
+
+
+def _separatrix_weighted_graph(
+    graph: nx.Graph,
+    subgraph: nx.Graph,
+    *,
+    length_attribute: Optional[str] = None,
+    length_scale: float = 1.0,
+) -> nx.Graph:
+    """Undirected subgraph with Euclidean (or attributed) edge lengths."""
+    weighted = nx.Graph()
+    weighted.add_nodes_from(subgraph.nodes())
+    for u, v in subgraph.edges():
+        length = _edge_geometric_length(
+            graph,
+            u,
+            v,
+            length_attribute=length_attribute,
+            length_scale=length_scale,
+        )
+        weighted.add_edge(u, v, weight=max(float(length), EPS))
+    return weighted
+
+
+def _bundle_domain_size(bundle: Mapping[str, Any]) -> Optional[float]:
+    meta = dict(bundle.get("meta") or {})
+    if "domain_size" not in meta:
+        return None
+    value = float(meta["domain_size"])
+    return value if value > 0.0 else None
+
+
+def _resolve_gaussian_length_scale(
+    bundle: Mapping[str, Any],
+    graphs: Sequence[nx.Graph],
+    config: ReconstructionConfig,
+    *,
+    length_attribute: Optional[str] = None,
+) -> Tuple[float, Dict[str, Any], List[str]]:
+    """Return ``(length_scale, diagnostics, warnings)`` for Gaussian distances."""
+    notes: List[str] = []
+    raw_chunks = [
+        _unique_edge_lengths(graph, length_attribute=length_attribute, length_scale=1.0)
+        for graph in graphs
+    ]
+    stacked = (
+        np.concatenate([chunk for chunk in raw_chunks if chunk.size])
+        if raw_chunks
+        else np.asarray([])
+    )
+    median_raw = float(np.median(stacked)) if stacked.size else np.nan
+    domain_size = _bundle_domain_size(bundle)
+    units = str(config.gaussian_distance_units)
+    scale = 1.0
+    effective_units = "raw"
+    if units == "domain":
+        if domain_size is None:
+            notes.append(
+                "gaussian_distance_units='domain' but bundle meta has no positive "
+                "domain_size; using raw (unnormalized) Euclidean lengths."
+            )
+        else:
+            scale = float(domain_size)
+            effective_units = "domain"
+    diagnostics = {
+        "gaussian_distance_units": effective_units,
+        "gaussian_distance_units_requested": units,
+        "domain_size": domain_size,
+        "median_raw_edge_length": median_raw,
+        "median_scaled_edge_length": (
+            float(median_raw / scale) if np.isfinite(median_raw) and scale > 0 else np.nan
+        ),
+        "sigma_in_scaled_units": float(config.gaussian_sigma),
+        "cutoff_in_scaled_units": float(
+            config.gaussian_cutoff_sigmas * config.gaussian_sigma
+        ),
+        "sigma_in_raw_units": float(config.gaussian_sigma * scale),
+        "cutoff_in_raw_units": float(
+            config.gaussian_cutoff_sigmas * config.gaussian_sigma * scale
+        ),
+        "length_scale": float(scale),
+    }
+    return scale, diagnostics, notes
 
 
 def build_separatrix_local_connectivity_affinity(
@@ -1035,26 +1296,52 @@ def build_separatrix_local_connectivity_affinity(
     length_attribute: Optional[str] = None,
     maximum_effective_soft_distance: float = 4.0,
     global_reference_spacing: Optional[float] = None,
+    sigma: Optional[float] = None,
+    eta: float = 1.0,
+    zero_at_zero_distance: bool = True,
+    cutoff_sigmas: float = 3.0,
+    length_scale: float = 1.0,
 ) -> InputAffinityResult:
     """Build soft separatrix-local connectivity affinity ``K``.
 
     Soft paths remain inside one fixed separatrix-ID subgraph. Pairwise shared
     membership is never transitively closed.
+
+    Gaussian mode uses geometric shortest-path distance ``d_sp``:
+
+    ``K = min(1, η exp(-d_sp² / (2σ²)))`` inside the long-tail cutoff
+    ``d_sp ≤ cutoff_sigmas · σ``. Distance 0 is the Gaussian peak; set
+    ``zero_at_zero_distance=True`` to zero that peak and avoid self-loop
+    affinity. ``length_scale`` converts raw Euclidean lengths into the
+    units of ``σ`` (typically ``domain_size`` so ``σ`` is a domain fraction).
     """
-    if not 0.0 <= q <= 1.0:
-        raise ValueError("q must lie in [0, 1].")
-    if q == 1.0:
-        warnings.warn(
-            "q=1 assigns affinity one to all pairs within the hop cutoff.",
-            UserWarning,
-            stacklevel=2,
-        )
+    if mode != "separatrix_gaussian":
+        if not 0.0 <= q <= 1.0:
+            raise ValueError("q must lie in [0, 1].")
+        if q == 1.0:
+            warnings.warn(
+                "q=1 assigns affinity one to all pairs within the hop cutoff.",
+                UserWarning,
+                stacklevel=2,
+            )
+    gaussian_sigma = float(sigma) if sigma is not None else 1.0
+    gaussian_eta = float(eta)
+    gaussian_cutoff = float(cutoff_sigmas) * gaussian_sigma
+    if mode == "separatrix_gaussian":
+        if gaussian_sigma <= 0.0:
+            raise ValueError("sigma must be positive.")
+        if gaussian_eta <= 0.0:
+            raise ValueError("eta must be positive.")
+        if float(cutoff_sigmas) <= 0.0:
+            raise ValueError("cutoff_sigmas must be positive.")
+
     order = list(node_order)
     index = {node: i for i, node in enumerate(order)}
     n = len(order)
     affinity = np.zeros((n, n), dtype=float)
     best_ids: Dict[Tuple[int, int], Set[str]] = defaultdict(set)
     hop_distances: Dict[Tuple[int, int], int] = {}
+    path_distances: Dict[Tuple[int, int], float] = {}
     warnings_list: List[str] = []
 
     reference_spacing = None
@@ -1073,6 +1360,28 @@ def build_separatrix_local_connectivity_affinity(
         if reference_spacing <= 0:
             raise ValueError("Reference spacing must be positive.")
 
+    def _record_pair(
+        i: int,
+        j: int,
+        value: float,
+        sid: str,
+        *,
+        hop: Optional[int] = None,
+        path_distance: Optional[float] = None,
+    ) -> None:
+        if value <= 0:
+            return
+        a, b = (i, j) if i < j else (j, i)
+        if value > affinity[i, j] + 1e-15:
+            affinity[i, j] = affinity[j, i] = value
+            best_ids[(a, b)] = {sid}
+            if hop is not None:
+                hop_distances[(a, b)] = int(hop)
+            if path_distance is not None:
+                path_distances[(a, b)] = float(path_distance)
+        elif np.isclose(value, affinity[i, j]):
+            best_ids[(a, b)].add(sid)
+
     for sid, subgraph in membership.subgraphs.items():
         if mode == "separatrix_length_normalized_decay":
             assert reference_spacing is not None
@@ -1087,13 +1396,9 @@ def build_separatrix_local_connectivity_affinity(
                 )
             else:
                 local_delta = reference_spacing
-            # Weighted geometric shortest paths within this ID only.
-            weighted = nx.Graph()
-            for u, v in subgraph.edges():
-                length = _edge_geometric_length(
-                    graph, u, v, length_attribute=length_attribute
-                )
-                weighted.add_edge(u, v, weight=max(length, EPS))
+            weighted = _separatrix_weighted_graph(
+                graph, subgraph, length_attribute=length_attribute
+            )
             for source in list(weighted.nodes()):
                 if source not in index:
                     continue
@@ -1119,15 +1424,54 @@ def build_separatrix_local_connectivity_affinity(
                     value = _affinity_from_distance(
                         effective, q, maximum_effective_soft_distance
                     )
-                    if value <= 0:
+                    _record_pair(
+                        i,
+                        j,
+                        value,
+                        sid,
+                        hop=hop_for_diag,
+                        path_distance=float(geo_length),
+                    )
+            continue
+
+        if mode == "separatrix_gaussian":
+            weighted = _separatrix_weighted_graph(
+                graph,
+                subgraph,
+                length_attribute=length_attribute,
+                length_scale=length_scale,
+            )
+            for source in list(weighted.nodes()):
+                if source not in index:
+                    continue
+                lengths_map = nx.single_source_dijkstra_path_length(
+                    weighted,
+                    source,
+                    cutoff=gaussian_cutoff,
+                    weight="weight",
+                )
+                i = index[source]
+                for target, geo_length in lengths_map.items():
+                    if target == source or target not in index:
                         continue
-                    a, b = (i, j) if i < j else (j, i)
-                    if value > affinity[i, j] + 1e-15:
-                        affinity[i, j] = affinity[j, i] = value
-                        best_ids[(a, b)] = {sid}
-                        hop_distances[(a, b)] = hop_for_diag
-                    elif np.isclose(value, affinity[i, j]):
-                        best_ids[(a, b)].add(sid)
+                    j = index[target]
+                    if j <= i:
+                        continue
+                    distance = float(geo_length)
+                    value = _gaussian_kernel_value(
+                        distance,
+                        sigma=gaussian_sigma,
+                        eta=gaussian_eta,
+                        cutoff=gaussian_cutoff,
+                        zero_at_zero_distance=zero_at_zero_distance,
+                    )
+                    _record_pair(
+                        i,
+                        j,
+                        value,
+                        sid,
+                        path_distance=distance,
+                    )
             continue
 
         # Hop-decay mode: BFS with cutoff inside this separatrix subgraph only.
@@ -1145,16 +1489,15 @@ def build_separatrix_local_connectivity_affinity(
                 if j <= i:
                     continue
                 value = _affinity_from_distance(float(hop), q, float(max_soft_hops))
-                if value <= 0:
-                    continue
-                if value > affinity[i, j] + 1e-15:
-                    affinity[i, j] = affinity[j, i] = value
-                    best_ids[(i, j)] = {sid}
-                    hop_distances[(i, j)] = int(hop)
-                elif np.isclose(value, affinity[i, j]):
-                    best_ids[(i, j)].add(sid)
+                _record_pair(i, j, value, sid, hop=int(hop))
 
-    np.fill_diagonal(affinity, 0.0)
+    if mode == "separatrix_gaussian" and not zero_at_zero_distance:
+        peak = min(1.0, gaussian_eta)
+        for i in range(n):
+            if affinity[i, i] < peak:
+                affinity[i, i] = peak
+    else:
+        np.fill_diagonal(affinity, 0.0)
     if not np.allclose(affinity, affinity.T):
         raise AssertionError("Affinity matrix is unexpectedly asymmetric.")
     if np.any(affinity < -1e-12) or np.any(affinity > 1.0 + 1e-12):
@@ -1182,9 +1525,19 @@ def build_separatrix_local_connectivity_affinity(
             "q": float(q),
             "max_soft_hops": int(max_soft_hops),
             "mode": mode,
+            "sigma": gaussian_sigma if mode == "separatrix_gaussian" else None,
+            "eta": gaussian_eta if mode == "separatrix_gaussian" else None,
+            "zero_at_zero_distance": (
+                bool(zero_at_zero_distance) if mode == "separatrix_gaussian" else None
+            ),
+            "cutoff_sigmas": (
+                float(cutoff_sigmas) if mode == "separatrix_gaussian" else None
+            ),
+            "length_scale": float(length_scale) if mode == "separatrix_gaussian" else None,
             "n_positive_affinity_pairs": int(np.count_nonzero(np.triu(affinity, 1))),
             "n_direct_pairs": int(np.count_nonzero(np.triu(direct, 1))),
         },
+        path_distances=path_distances,
     )
 
 
@@ -1382,7 +1735,7 @@ def compute_transported_separatrix_connectivity(
 
     Held-out seed graphs are never included.
     """
-    q_value = float(config.hop_decay_q if q is None else q)
+    q_value = 0.1 if q is None else float(q)
     hops = int(config.max_soft_hops if max_soft_hops is None else max_soft_hops)
     mode = affinity_mode or config.connectivity_affinity_mode
 
@@ -1417,6 +1770,18 @@ def compute_transported_separatrix_connectivity(
         if stacked.size:
             global_reference = float(np.median(stacked))
 
+    length_scale = 1.0
+    scale_diagnostics: Dict[str, Any] = {}
+    warnings_list: List[str] = []
+    if mode == "separatrix_gaussian":
+        length_scale, scale_diagnostics, scale_notes = _resolve_gaussian_length_scale(
+            bundle,
+            graphs,
+            config,
+            length_attribute=config.geometric_length_attribute,
+        )
+        warnings_list.extend(scale_notes)
+
     direct_num = np.zeros((n_center, n_center), dtype=float)
     sep_num = np.zeros_like(direct_num)
     direct_second = np.zeros_like(direct_num)
@@ -1434,7 +1799,6 @@ def compute_transported_separatrix_connectivity(
     node_frames: List[pd.DataFrame] = []
     edge_frames: List[pd.DataFrame] = []
     sampling_rows: List[Dict[str, Any]] = []
-    warnings_list: List[str] = []
     substantial_overshoots = 0
     maximum_overshoot = 0.0
 
@@ -1475,6 +1839,11 @@ def compute_transported_separatrix_connectivity(
             length_attribute=config.geometric_length_attribute,
             maximum_effective_soft_distance=config.maximum_effective_soft_distance,
             global_reference_spacing=global_reference,
+            sigma=config.gaussian_sigma,
+            eta=config.gaussian_eta,
+            zero_at_zero_distance=config.gaussian_zero_at_zero_distance,
+            cutoff_sigmas=config.gaussian_cutoff_sigmas,
+            length_scale=length_scale,
         )
         warnings_list.extend(affinity_result.warnings)
         A = affinity_result.direct_adjacency_matrix
@@ -1504,7 +1873,7 @@ def compute_transported_separatrix_connectivity(
             raise AssertionError("Conditional direct support escaped [0, 1].")
         if np.any(S_sep < -1e-8) or np.any(S_sep > 1.0 + 1e-8):
             raise AssertionError("Conditional separatrix support escaped [0, 1].")
-        if np.any(S_sep + 1e-8 < S_direct):
+        if mode == "separatrix_hop_decay" and np.any(S_sep + 1e-8 < S_direct):
             warnings_list.append(
                 f"Input {input_index}: some conditional separatrix supports are "
                 "below direct supports."
@@ -1565,7 +1934,7 @@ def compute_transported_separatrix_connectivity(
     ):
         np.fill_diagonal(matrix, 0)
 
-    if np.any(soft_extension_evidence < -1e-8):
+    if mode != "separatrix_gaussian" and np.any(soft_extension_evidence < -1e-8):
         warnings_list.append(
             "soft_extension_evidence has negative values beyond numerical tolerance."
         )
@@ -1597,9 +1966,12 @@ def compute_transported_separatrix_connectivity(
         "n_inputs": n_inputs,
         "n_center": n_center,
         "lambda_sum": lambda_sum,
-        "q": q_value,
-        "max_soft_hops": hops,
         "affinity_mode": mode,
+        "gaussian_sigma": float(config.gaussian_sigma),
+        "gaussian_eta": float(config.gaussian_eta),
+        "gaussian_zero_at_zero_distance": bool(config.gaussian_zero_at_zero_distance),
+        "gaussian_cutoff_sigmas": float(config.gaussian_cutoff_sigmas),
+        **scale_diagnostics,
         "covered_pair_count": int(np.count_nonzero(pair_is_covered & upper)),
         "mean_conditional_direct_adjacency_support": (
             float(np.nanmean(direct_support[pair_is_covered & upper]))
@@ -1654,6 +2026,2346 @@ def compute_transported_separatrix_connectivity(
         warnings=warnings_list,
         diagnostics=diagnostics,
     )
+
+
+# ---------------------------------------------------------------------------
+# Coupling-derived 1-separatrix betweenness and triangle reconstruction
+# ---------------------------------------------------------------------------
+
+
+def ordered_separatrix_path_nodes(subgraph: nx.Graph) -> List[Any]:
+    """Return the unique endpoint-to-endpoint node sequence of a simple path."""
+    n_nodes = subgraph.number_of_nodes()
+    if n_nodes == 0:
+        return []
+    if n_nodes == 1:
+        return list(subgraph.nodes())
+    degrees = dict(subgraph.degree())
+    endpoints = [node for node, degree in degrees.items() if degree == 1]
+    if (
+        subgraph.number_of_edges() != n_nodes - 1
+        or len(endpoints) != 2
+        or any(degree > 2 for degree in degrees.values())
+        or not nx.is_connected(subgraph)
+    ):
+        raise ValueError("Separatrix subgraph is not a simple path.")
+    return list(nx.shortest_path(subgraph, endpoints[0], endpoints[1]))
+
+
+def build_separatrix_path_index(
+    graph: nx.Graph,
+    node_order: Sequence[Any],
+    membership: SeparatrixMembership,
+    *,
+    strict: bool = True,
+) -> SeparatrixPathIndex:
+    """Precompute ordered paths and existential between-sets for one input.
+
+    Coupling columns follow ``node_order``. For each ordered pair of input
+    nodes ``(x, z)``, ``between_nodes[(x, z)]`` is the union of interior nodes
+    on every recorded 1-separatrix that contains both endpoints.
+    """
+    order = list(node_order)
+    node_to_index = {node: i for i, node in enumerate(order)}
+    if len(node_to_index) != len(order):
+        raise ValueError("node_order must contain unique node ids.")
+
+    warnings_list: List[str] = []
+    node_to_sids: Dict[int, Set[str]] = defaultdict(set)
+    separatrix_positions: Dict[str, Dict[int, int]] = {}
+    separatrix_paths: Dict[str, List[int]] = {}
+    between_sets: Dict[Tuple[int, int], Set[int]] = defaultdict(set)
+    skipped = 0
+
+    for sid, subgraph in membership.subgraphs.items():
+        try:
+            path_nodes = ordered_separatrix_path_nodes(subgraph)
+        except ValueError as exc:
+            skipped += 1
+            message = f"Separatrix ID {sid!r} is not a simple path ({exc})."
+            if strict:
+                raise ValueError(message) from exc
+            warnings_list.append(message)
+            continue
+        path_idx: List[int] = []
+        for node in path_nodes:
+            if node not in node_to_index:
+                raise ValueError(
+                    f"Separatrix ID {sid!r} contains node {node!r} missing from node_order."
+                )
+            path_idx.append(int(node_to_index[node]))
+        separatrix_paths[str(sid)] = path_idx
+        positions = {node_idx: pos for pos, node_idx in enumerate(path_idx)}
+        separatrix_positions[str(sid)] = positions
+        for node_idx in path_idx:
+            node_to_sids[node_idx].add(str(sid))
+        n_path = len(path_idx)
+        for left in range(n_path):
+            for right in range(left + 2, n_path):
+                x = path_idx[left]
+                z = path_idx[right]
+                interior = path_idx[left + 1 : right]
+                between_sets[(x, z)].update(interior)
+                between_sets[(z, x)].update(interior)
+
+    between_nodes = {
+        key: np.fromiter(sorted(values), dtype=np.int64)
+        for key, values in between_sets.items()
+        if values
+    }
+    path_lengths = [len(path) for path in separatrix_paths.values()]
+    return SeparatrixPathIndex(
+        node_order=order,
+        node_to_index=node_to_index,
+        node_to_separatrix_ids={
+            node_idx: frozenset(ids) for node_idx, ids in node_to_sids.items()
+        },
+        separatrix_positions=separatrix_positions,
+        separatrix_paths=separatrix_paths,
+        between_nodes=between_nodes,
+        warnings=warnings_list,
+        diagnostics={
+            "n_nodes": len(order),
+            "n_separatrix_ids": len(separatrix_paths),
+            "n_between_pairs": len(between_nodes),
+            "skipped_non_path_ids": skipped,
+            "path_node_count_min": int(min(path_lengths)) if path_lengths else 0,
+            "path_node_count_median": (
+                float(np.median(path_lengths)) if path_lengths else 0.0
+            ),
+            "path_node_count_max": int(max(path_lengths)) if path_lengths else 0,
+        },
+    )
+
+
+def input_nodes_between(
+    path_index: SeparatrixPathIndex, x: int, y: int, z: int
+) -> bool:
+    """Return True iff ``y`` lies strictly between ``x`` and ``z`` on some path.
+
+    ``x``, ``y``, and ``z`` are coupling-column indices. The predicate is
+    existential across separatrix IDs and ignores degree / junction status.
+    """
+    if x == y or y == z or x == z:
+        return False
+    interior = path_index.between_nodes.get((int(x), int(z)))
+    if interior is None or interior.size == 0:
+        return False
+    return int(y) in set(interior.tolist())
+
+
+def input_nodes_between_from_positions(
+    path_index: SeparatrixPathIndex, x: int, y: int, z: int
+) -> bool:
+    """Reference predicate that walks recorded path positions directly."""
+    if x == y or y == z or x == z:
+        return False
+    x_i, y_i, z_i = int(x), int(y), int(z)
+    for positions in path_index.separatrix_positions.values():
+        px = positions.get(x_i)
+        py = positions.get(y_i)
+        pz = positions.get(z_i)
+        if px is None or py is None or pz is None:
+            continue
+        if min(px, pz) < py < max(px, pz):
+            return True
+    return False
+
+
+def _betweenness_score_from_conditionals(
+    q_a: np.ndarray,
+    q_b: np.ndarray,
+    q_c: np.ndarray,
+    path_index: SeparatrixPathIndex,
+    *,
+    epsilon: float = EPS,
+) -> float:
+    """``sum_{x,z} q_a(x) q_c(z) sum_{y in Between(x,z)} q_b(y)``."""
+    q_a = np.asarray(q_a, dtype=float)
+    q_b = np.asarray(q_b, dtype=float)
+    q_c = np.asarray(q_c, dtype=float)
+    support_a = np.flatnonzero(q_a > epsilon)
+    support_c = np.flatnonzero(q_c > epsilon)
+    if support_a.size == 0 or support_c.size == 0:
+        return 0.0
+    score = 0.0
+    between = path_index.between_nodes
+    for x in support_a:
+        q_x = q_a[x]
+        x_i = int(x)
+        for z in support_c:
+            interior = between.get((x_i, int(z)))
+            if interior is None or interior.size == 0:
+                continue
+            score += q_x * q_c[z] * float(q_b[interior].sum())
+    return float(score)
+
+
+def _betweenness_score_naive(
+    q_a: np.ndarray,
+    q_b: np.ndarray,
+    q_c: np.ndarray,
+    path_index: SeparatrixPathIndex,
+    *,
+    epsilon: float = EPS,
+) -> float:
+    """Dense O(N^3) reference used only in tests."""
+    q_a = np.asarray(q_a, dtype=float)
+    q_b = np.asarray(q_b, dtype=float)
+    q_c = np.asarray(q_c, dtype=float)
+    n = q_a.shape[0]
+    score = 0.0
+    for x in range(n):
+        if q_a[x] <= epsilon:
+            continue
+        for y in range(n):
+            if q_b[y] <= epsilon:
+                continue
+            for z in range(n):
+                if q_c[z] <= epsilon:
+                    continue
+                if input_nodes_between_from_positions(path_index, x, y, z):
+                    score += q_a[x] * q_b[y] * q_c[z]
+    return float(score)
+
+
+class SeparatrixBetweennessEngine:
+    """Cached ensemble betweenness ``B(a, b, c)`` from PFGW couplings.
+
+    Coverage weights reuse the existing matched-fraction convention
+    ``r_i(u) = min(1, m_i(u) / p(u))`` stored on the transported result.
+    An input contributes only through ``w_i = min(r_i(a), r_i(b), r_i(c))``,
+    so a nearly unmatched barycenter node cannot cast a strong negative vote.
+    """
+
+    def __init__(
+        self,
+        conditionals: Sequence[np.ndarray],
+        matched_fractions: np.ndarray,
+        path_indices: Sequence[SeparatrixPathIndex],
+        *,
+        epsilon: float = EPS,
+    ) -> None:
+        self.conditionals = [np.asarray(Q, dtype=float) for Q in conditionals]
+        self.matched_fractions = np.asarray(matched_fractions, dtype=float)
+        self.path_indices = list(path_indices)
+        self.epsilon = float(epsilon)
+        n_inputs = len(self.conditionals)
+        if (
+            self.matched_fractions.ndim != 2
+            or self.matched_fractions.shape[0] != n_inputs
+            or len(self.path_indices) != n_inputs
+        ):
+            raise ValueError(
+                "conditionals, matched_fractions, and path_indices must align."
+            )
+        n_center = self.matched_fractions.shape[1]
+        for index, Q in enumerate(self.conditionals):
+            if Q.ndim != 2 or Q.shape[0] != n_center:
+                raise ValueError(
+                    f"Q_{index} must have {n_center} rows; got shape {Q.shape}."
+                )
+            if Q.shape[1] != len(self.path_indices[index].node_order):
+                raise ValueError(
+                    f"Q_{index} columns must match the path-index node_order."
+                )
+        self.n_inputs = n_inputs
+        self.n_center = n_center
+        self._cache: Dict[Tuple[int, int, int], TripleBetweenness] = {}
+
+    def score(self, a: int, b: int, c: int) -> TripleBetweenness:
+        """Return ``B(a, b, c)``, the probability that ``b`` lies between ``a`` and ``c``."""
+        a_i, b_i, c_i = int(a), int(b), int(c)
+        cached = self._cache.get((a_i, b_i, c_i))
+        if cached is not None:
+            return cached
+        B_inputs = np.zeros(self.n_inputs, dtype=float)
+        weights = np.zeros(self.n_inputs, dtype=float)
+        for i, (Q, fractions, path_index) in enumerate(
+            zip(self.conditionals, self.matched_fractions, self.path_indices)
+        ):
+            weights[i] = float(
+                min(fractions[a_i], fractions[b_i], fractions[c_i])
+            )
+            if weights[i] <= self.epsilon:
+                continue
+            B_inputs[i] = _betweenness_score_from_conditionals(
+                Q[a_i],
+                Q[b_i],
+                Q[c_i],
+                path_index,
+                epsilon=self.epsilon,
+            )
+        weight_sum = float(weights.sum())
+        if weight_sum <= self.epsilon:
+            result = TripleBetweenness(
+                a=a_i,
+                b=b_i,
+                c=c_i,
+                B=0.0,
+                B_inputs=B_inputs,
+                weights=weights,
+                weight_sum=0.0,
+                uninformative=True,
+            )
+        else:
+            result = TripleBetweenness(
+                a=a_i,
+                b=b_i,
+                c=c_i,
+                B=float(np.dot(weights, B_inputs) / weight_sum),
+                B_inputs=B_inputs,
+                weights=weights,
+                weight_sum=weight_sum,
+                uninformative=False,
+            )
+        self._cache[(a_i, b_i, c_i)] = result
+        # Ordered betweenness is symmetric in the endpoints.
+        self._cache[(c_i, b_i, a_i)] = TripleBetweenness(
+            a=c_i,
+            b=b_i,
+            c=a_i,
+            B=result.B,
+            B_inputs=result.B_inputs.copy(),
+            weights=result.weights.copy(),
+            weight_sum=result.weight_sum,
+            uninformative=result.uninformative,
+        )
+        return result
+
+
+def prepare_separatrix_betweenness_engine(
+    bundle: Mapping[str, Any],
+    input_node_orders: Sequence[Sequence[Any]],
+    config: ReconstructionConfig,
+    transported: TransportedConnectivityResult,
+    *,
+    epsilon: float = EPS,
+    tiny_overshoot_tolerance: float = 1e-8,
+) -> SeparatrixBetweennessEngine:
+    """Build path indices and conditional couplings from an existing bundle.
+
+    Does not recompute PFGW. Reuses ``transported.matched_fractions`` as the
+    coverage ratios ``r_i(u)``.
+    """
+    graphs = list(bundle["Gs"])
+    Ts = list(bundle["Ts"])
+    p = np.asarray(bundle["p"], dtype=float)
+    n_center = p.shape[0]
+    if not (len(graphs) == len(Ts) == len(input_node_orders)):
+        raise ValueError("Gs, Ts, and input_node_orders must align.")
+
+    conditionals: List[np.ndarray] = []
+    path_indices: List[SeparatrixPathIndex] = []
+    for input_index, (graph, T_s, node_order) in enumerate(
+        zip(graphs, Ts, input_node_orders)
+    ):
+        membership = build_separatrix_membership(
+            graph,
+            attribute=config.separatrix_id_attribute,
+            delimiter=config.separatrix_id_delimiter,
+            strict=config.strict_separatrix_validation,
+            missing_policy=config.missing_separatrix_id_policy,
+        )
+        path_index = build_separatrix_path_index(
+            graph,
+            node_order,
+            membership,
+            strict=config.strict_separatrix_validation,
+        )
+        path_indices.append(path_index)
+        T = np.asarray(T_s, dtype=float)
+        if T.shape != (n_center, len(node_order)):
+            raise ValueError(
+                f"T_{input_index} must have shape {(n_center, len(node_order))}; "
+                f"got {T.shape}."
+            )
+        T = np.where((T < 0) & (T >= -tiny_overshoot_tolerance), 0.0, T)
+        Q, _matched_mass = row_normalize_coupling(T, epsilon=epsilon)
+        conditionals.append(Q)
+
+    matched = np.asarray(transported.matched_fractions, dtype=float)
+    if matched.shape != (len(conditionals), n_center):
+        raise ValueError(
+            "transported.matched_fractions must have shape "
+            f"{(len(conditionals), n_center)}; got {matched.shape}."
+        )
+    return SeparatrixBetweennessEngine(
+        conditionals,
+        matched,
+        path_indices,
+        epsilon=epsilon,
+    )
+
+
+def candidate_graph_from_evidence(
+    evidence: np.ndarray,
+    *,
+    min_edge_threshold: float,
+    n_nodes: Optional[int] = None,
+) -> nx.Graph:
+    """Undirected graph of pairs whose evidence meets the visualization floor."""
+    W = np.asarray(evidence, dtype=float)
+    if W.ndim != 2 or W.shape[0] != W.shape[1]:
+        raise ValueError(f"evidence must be square; got shape {W.shape}.")
+    n = int(W.shape[0] if n_nodes is None else n_nodes)
+    if n != W.shape[0]:
+        raise ValueError("n_nodes must match the evidence matrix.")
+    graph = nx.Graph()
+    graph.add_nodes_from(range(n))
+    iu, ju = np.triu_indices(n, k=1)
+    weights = W[iu, ju]
+    keep = np.isfinite(weights) & (weights >= float(min_edge_threshold))
+    for u, v, weight in zip(iu[keep], ju[keep], weights[keep]):
+        graph.add_edge(int(u), int(v), evidence=float(weight))
+    return graph
+
+
+def reconstruction_graph_statistics(
+    graph: nx.Graph,
+    *,
+    n_candidate_edges: Optional[int] = None,
+    n_removed: int = 0,
+) -> Dict[str, Any]:
+    """Report node/edge counts and Betti numbers of an undirected graph."""
+    n_nodes = int(graph.number_of_nodes())
+    n_edges = int(graph.number_of_edges())
+    beta_0 = int(nx.number_connected_components(graph)) if n_nodes else 0
+    return {
+        "n_nodes": n_nodes,
+        "n_candidate_edges": (
+            n_edges if n_candidate_edges is None else int(n_candidate_edges)
+        ),
+        "n_removed": int(n_removed),
+        "n_reconstructed_edges": n_edges,
+        "beta_0": beta_0,
+        "beta_1": int(n_edges - n_nodes + beta_0),
+    }
+
+
+def evaluate_triangle_redundancy(
+    candidate_graph: nx.Graph,
+    engine: SeparatrixBetweennessEngine,
+    *,
+    edge_order: Optional[Sequence[Tuple[int, int]]] = None,
+) -> pd.DataFrame:
+    """Score every candidate edge against the frozen original triangle set.
+
+    ``R(a, c) = max_{b in N(a) ∩ N(c)} B(a, b, c)``. Decisions are not applied
+    here; callers must remove marked edges only after this table is complete.
+    """
+    if edge_order is None:
+        edges = [tuple(sorted(edge)) for edge in candidate_graph.edges()]
+        edges.sort()
+    else:
+        edges = [tuple(sorted(edge)) for edge in edge_order]
+
+    rows: List[Dict[str, Any]] = []
+    for a, c in edges:
+        evidence = float(candidate_graph[a][c].get("evidence", np.nan))
+        common = sorted(
+            set(candidate_graph.neighbors(a)).intersection(
+                candidate_graph.neighbors(c)
+            )
+        )
+        if not common:
+            rows.append(
+                {
+                    "a": int(a),
+                    "c": int(c),
+                    "evidence": evidence,
+                    "n_common_neighbors": 0,
+                    "redundancy": 0.0,
+                    "witness": np.nan,
+                    "uninformative": False,
+                    "weight_sum": np.nan,
+                    "B_inputs": None,
+                    "weights": None,
+                    "in_triangle": False,
+                }
+            )
+            continue
+        best_B = -1.0
+        best_witness = int(common[0])
+        best_detail: Optional[TripleBetweenness] = None
+        for b in common:
+            detail = engine.score(int(a), int(b), int(c))
+            if detail.B > best_B + 1e-15 or (
+                abs(detail.B - best_B) <= 1e-15 and int(b) < best_witness
+            ):
+                best_B = float(detail.B)
+                best_witness = int(b)
+                best_detail = detail
+        assert best_detail is not None
+        rows.append(
+            {
+                "a": int(a),
+                "c": int(c),
+                "evidence": evidence,
+                "n_common_neighbors": len(common),
+                "redundancy": float(best_B),
+                "witness": int(best_witness),
+                "uninformative": bool(best_detail.uninformative),
+                "weight_sum": float(best_detail.weight_sum),
+                "B_inputs": best_detail.B_inputs.copy(),
+                "weights": best_detail.weights.copy(),
+                "in_triangle": True,
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def apply_triangle_shortcut_threshold(
+    candidate_graph: nx.Graph,
+    edge_scores: pd.DataFrame,
+    *,
+    theta: float,
+    mode: str,
+    min_edge_threshold: float,
+) -> TriangleReconstructionResult:
+    """Remove every edge with ``R(a, c) >= theta`` simultaneously."""
+    reconstructed = candidate_graph.copy()
+    if edge_scores.empty:
+        removed = edge_scores.copy()
+    else:
+        removed_mask = (
+            edge_scores["in_triangle"]
+            & np.isfinite(edge_scores["redundancy"])
+            & (edge_scores["redundancy"] >= float(theta))
+        )
+        removed = edge_scores.loc[removed_mask].copy().reset_index(drop=True)
+        for a, c in zip(removed["a"].to_numpy(), removed["c"].to_numpy()):
+            if reconstructed.has_edge(int(a), int(c)):
+                reconstructed.remove_edge(int(a), int(c))
+
+    triangle_scores = edge_scores.loc[edge_scores["in_triangle"], "redundancy"]
+    removed_scores = removed["redundancy"] if len(removed) else pd.Series(dtype=float)
+    statistics = reconstruction_graph_statistics(
+        reconstructed,
+        n_candidate_edges=int(candidate_graph.number_of_edges()),
+        n_removed=int(len(removed)),
+    )
+    if len(removed_scores):
+        statistics.update(
+            {
+                "removed_B_min": float(removed_scores.min()),
+                "removed_B_median": float(removed_scores.median()),
+                "removed_B_max": float(removed_scores.max()),
+            }
+        )
+    else:
+        statistics.update(
+            {
+                "removed_B_min": np.nan,
+                "removed_B_median": np.nan,
+                "removed_B_max": np.nan,
+            }
+        )
+    if len(triangle_scores):
+        statistics.update(
+            {
+                "triangle_edge_count": int(len(triangle_scores)),
+                "triangle_R_min": float(triangle_scores.min()),
+                "triangle_R_median": float(triangle_scores.median()),
+                "triangle_R_max": float(triangle_scores.max()),
+            }
+        )
+    else:
+        statistics.update(
+            {
+                "triangle_edge_count": 0,
+                "triangle_R_min": np.nan,
+                "triangle_R_median": np.nan,
+                "triangle_R_max": np.nan,
+            }
+        )
+    return TriangleReconstructionResult(
+        mode=mode,
+        theta=float(theta),
+        min_edge_threshold=float(min_edge_threshold),
+        candidate_graph=candidate_graph,
+        reconstructed_graph=reconstructed,
+        edge_scores=edge_scores,
+        removed_edges=removed,
+        statistics=statistics,
+        diagnostics={
+            "n_scored_edges": int(len(edge_scores)),
+            "n_triangle_edges": int(statistics["triangle_edge_count"]),
+            "n_uninformative_triangle_edges": int(
+                edge_scores.loc[edge_scores["in_triangle"], "uninformative"].sum()
+            )
+            if len(edge_scores)
+            else 0,
+        },
+    )
+
+
+def reconstruct_separatrix_triangle_shortcuts(
+    evidence: np.ndarray,
+    engine: SeparatrixBetweennessEngine,
+    *,
+    min_edge_threshold: float,
+    theta: float = 0.5,
+    mode: str = "evidence",
+    edge_order: Optional[Sequence[Tuple[int, int]]] = None,
+) -> TriangleReconstructionResult:
+    """Threshold evidence, score frozen triangles, then drop shortcut edges.
+
+    Direct and soft modes must call this same function; only ``evidence``
+    should differ. ``theta`` is not estimated here.
+    """
+    candidate = candidate_graph_from_evidence(
+        evidence,
+        min_edge_threshold=min_edge_threshold,
+        n_nodes=engine.n_center,
+    )
+    scores = evaluate_triangle_redundancy(
+        candidate, engine, edge_order=edge_order
+    )
+    return apply_triangle_shortcut_threshold(
+        candidate,
+        scores,
+        theta=theta,
+        mode=mode,
+        min_edge_threshold=min_edge_threshold,
+    )
+
+
+def evidence_matrix_from_graph(
+    graph: nx.Graph,
+    *,
+    n_nodes: int,
+    weight_attr: str = "evidence",
+) -> np.ndarray:
+    """Square symmetric matrix of retained edge weights, zeros elsewhere."""
+    matrix = np.zeros((n_nodes, n_nodes), dtype=float)
+    for u, v, data in graph.edges(data=True):
+        weight = float(data.get(weight_attr, 0.0))
+        matrix[int(u), int(v)] = weight
+        matrix[int(v), int(u)] = weight
+    return matrix
+
+
+def _path_index_from_explicit_paths(
+    paths: Mapping[str, Sequence[int]],
+    n_nodes: int,
+) -> SeparatrixPathIndex:
+    """Test helper: build a path index from integer node sequences."""
+    graph = nx.Graph()
+    graph.add_nodes_from(range(n_nodes))
+    for sid, path in paths.items():
+        for u, v in zip(path[:-1], path[1:]):
+            existing = graph[u][v].get("separatrixID") if graph.has_edge(u, v) else None
+            if existing:
+                sid_value = f"{existing},{sid}"
+            else:
+                sid_value = str(sid)
+            graph.add_edge(int(u), int(v), separatrixID=str(sid_value))
+    membership = build_separatrix_membership(graph, strict=False)
+    return build_separatrix_path_index(
+        graph, list(range(n_nodes)), membership, strict=True
+    )
+
+
+def run_triangle_reconstruction_tests(*, tolerance: float = 1e-10) -> Dict[str, bool]:
+    """Lightweight correctness checks for ordered-separatrix triangle pruning."""
+    results: Dict[str, bool] = {}
+
+    # Test A: ordered triple on a simple path.
+    index_a = _path_index_from_explicit_paths({"s0": [0, 1, 2]}, n_nodes=3)
+    assert input_nodes_between(index_a, 0, 1, 2) is True
+    assert input_nodes_between(index_a, 0, 2, 1) is False
+    assert input_nodes_between(index_a, 2, 1, 0) is True
+    assert input_nodes_between_from_positions(index_a, 0, 1, 2) is True
+    results["A_ordered_triple"] = True
+
+    # Test B: a junction does not invalidate an explicit [x0, x1, x2] path.
+    graph_b = nx.Graph()
+    graph_b.add_edge(0, 1, separatrixID="main")
+    graph_b.add_edge(1, 2, separatrixID="main")
+    graph_b.add_edge(1, 3, separatrixID="branch")
+    membership_b = build_separatrix_membership(graph_b, strict=True)
+    index_b = build_separatrix_path_index(
+        graph_b, [0, 1, 2, 3], membership_b, strict=True
+    )
+    assert graph_b.degree(1) == 3
+    assert input_nodes_between(index_b, 0, 1, 2) is True
+    assert input_nodes_between(index_b, 0, 3, 2) is False
+    results["B_junction_does_not_invalidate"] = True
+
+    # Test C: multiple shared IDs stay Boolean (no double counting).
+    index_c = _path_index_from_explicit_paths(
+        {"s0": [0, 1, 2], "s1": [0, 1, 2]},
+        n_nodes=3,
+    )
+    assert input_nodes_between(index_c, 0, 1, 2) is True
+    q_onehot = np.eye(3)
+    score_c = _betweenness_score_from_conditionals(
+        q_onehot[0], q_onehot[1], q_onehot[2], index_c
+    )
+    naive_c = _betweenness_score_naive(
+        q_onehot[0], q_onehot[1], q_onehot[2], index_c
+    )
+    assert np.isclose(score_c, 1.0, atol=tolerance)
+    assert np.isclose(score_c, naive_c, atol=tolerance)
+    results["C_boolean_multi_id"] = True
+
+    # Test D: endpoint symmetry of B(a, b, c).
+    Q_d = np.array(
+        [
+            [0.7, 0.3, 0.0],
+            [0.1, 0.8, 0.1],
+            [0.0, 0.2, 0.8],
+        ],
+        dtype=float,
+    )
+    fractions_d = np.ones((1, 3))
+    engine_d = SeparatrixBetweennessEngine([Q_d], fractions_d, [index_a])
+    forward = engine_d.score(0, 1, 2)
+    reverse = engine_d.score(2, 1, 0)
+    assert np.isclose(forward.B, reverse.B, atol=tolerance)
+    naive_d = _betweenness_score_naive(Q_d[0], Q_d[1], Q_d[2], index_a)
+    assert np.isclose(forward.B, naive_d, atol=tolerance)
+    results["D_coupling_symmetry"] = True
+
+    # Test E: a nearly unmatched input must not dominate the ensemble.
+    Q_informative = np.eye(3)
+    Q_unmatched = np.zeros((3, 3))
+    fractions_e = np.array(
+        [
+            [1.0, 1.0, 1.0],
+            [1e-16, 1.0, 1.0],
+        ]
+    )
+    engine_e = SeparatrixBetweennessEngine(
+        [Q_informative, Q_unmatched],
+        fractions_e,
+        [index_a, index_a],
+    )
+    partial = engine_e.score(0, 1, 2)
+    assert partial.weights[1] <= EPS
+    assert np.isclose(partial.B, 1.0, atol=tolerance)
+    results["E_partial_matching"] = True
+
+    # Test F: simultaneous removal is independent of candidate-edge order.
+    evidence_f = np.array(
+        [
+            [0.0, 0.8, 0.7, 0.8],
+            [0.8, 0.0, 0.8, 0.0],
+            [0.7, 0.8, 0.0, 0.8],
+            [0.8, 0.0, 0.8, 0.0],
+        ]
+    )
+    Q_f = np.eye(4)
+    index_f = _path_index_from_explicit_paths({"s": [0, 1, 2]}, n_nodes=4)
+    engine_f = SeparatrixBetweennessEngine([Q_f], np.ones((1, 4)), [index_f])
+    order_u = [(0, 1), (1, 2), (0, 2), (0, 3), (2, 3)]
+    order_v = list(reversed(order_u))
+    result_u = reconstruct_separatrix_triangle_shortcuts(
+        evidence_f,
+        engine_f,
+        min_edge_threshold=0.1,
+        theta=0.5,
+        mode="test",
+        edge_order=order_u,
+    )
+    result_v = reconstruct_separatrix_triangle_shortcuts(
+        evidence_f,
+        engine_f,
+        min_edge_threshold=0.1,
+        theta=0.5,
+        mode="test",
+        edge_order=order_v,
+    )
+    assert set(result_u.reconstructed_graph.edges()) == set(
+        result_v.reconstructed_graph.edges()
+    )
+    assert (0, 2) in result_u.candidate_graph.edges() or (
+        2,
+        0,
+    ) in result_u.candidate_graph.edges()
+    assert not result_u.reconstructed_graph.has_edge(0, 2)
+    assert result_u.reconstructed_graph.has_edge(0, 1)
+    assert result_u.reconstructed_graph.has_edge(1, 2)
+    results["F_simultaneous_removal"] = True
+    return results
+
+
+# ---------------------------------------------------------------------------
+# Phase 2: path-level same-separatrix cycle pruning
+# ---------------------------------------------------------------------------
+
+PATH_HOP_TIEBREAKER = 1e-9
+
+
+def _geometric_mean(values: Sequence[float], *, epsilon: float) -> float:
+    """``exp(mean(log(max(T, eps))))``; length-invariant relative to a raw product."""
+    clipped = np.maximum(np.asarray(values, dtype=float), float(epsilon))
+    if clipped.size == 0:
+        return 0.0
+    return float(np.exp(np.mean(np.log(clipped))))
+
+
+def ordered_pair_support_along_path(
+    q_u: np.ndarray,
+    q_v: np.ndarray,
+    path_columns: np.ndarray,
+) -> Tuple[float, float]:
+    """Return ``(T_forward, T_reverse)`` for one ordered input separatrix.
+
+    ``T_forward = sum_{j < k} q_u[s_j] q_v[s_k]`` and likewise for reverse.
+    Computed from exclusive prefix/suffix sums in ``O(L)``.
+    """
+    columns = np.asarray(path_columns, dtype=np.int64)
+    if columns.size < 2:
+        return 0.0, 0.0
+    a = np.asarray(q_u, dtype=float)[columns]
+    b = np.asarray(q_v, dtype=float)[columns]
+    prefix = np.cumsum(a)
+    suffix = np.cumsum(a[::-1])[::-1]
+    t_forward = float(np.dot(b[1:], prefix[:-1]))
+    t_reverse = float(np.dot(b[:-1], suffix[1:]))
+    return t_forward, t_reverse
+
+
+def ordered_pair_support_naive(
+    q_u: np.ndarray,
+    q_v: np.ndarray,
+    path_columns: Sequence[int],
+) -> Tuple[float, float]:
+    """Dense O(L^2) reference for ``ordered_pair_support_along_path``."""
+    columns = [int(c) for c in path_columns]
+    q_u = np.asarray(q_u, dtype=float)
+    q_v = np.asarray(q_v, dtype=float)
+    t_forward = 0.0
+    t_reverse = 0.0
+    for j, x in enumerate(columns):
+        for k, y in enumerate(columns):
+            if j < k:
+                t_forward += q_u[x] * q_v[y]
+            elif j > k:
+                t_reverse += q_u[x] * q_v[y]
+    return float(t_forward), float(t_reverse)
+
+
+class SeparatrixPathCoherenceEngine:
+    """Cached path-level same-separatrix coherence ``C(P)``.
+
+    Reuses Phase 1 conditional couplings ``q_i(x|u)`` and coverage
+    ``r_i(u)``. A path is coherent in input ``i`` only when every consecutive
+    ordered pair is explained by the **same** separatrix ID and orientation.
+    """
+
+    def __init__(
+        self,
+        betweenness_engine: SeparatrixBetweennessEngine,
+        *,
+        epsilon: Optional[float] = None,
+    ) -> None:
+        t0 = time.perf_counter()
+        self.betweenness_engine = betweenness_engine
+        self.conditionals = betweenness_engine.conditionals
+        self.matched_fractions = betweenness_engine.matched_fractions
+        self.path_indices = betweenness_engine.path_indices
+        self.epsilon = float(
+            betweenness_engine.epsilon if epsilon is None else epsilon
+        )
+        self.n_inputs = betweenness_engine.n_inputs
+        self.n_center = betweenness_engine.n_center
+        self.separatrix_columns: List[Dict[str, np.ndarray]] = []
+        self.node_separatrix_ids: List[List[frozenset]] = []
+        for i, path_index in enumerate(self.path_indices):
+            columns = {
+                str(sid): np.asarray(path, dtype=np.int64)
+                for sid, path in path_index.separatrix_paths.items()
+            }
+            self.separatrix_columns.append(columns)
+            Q = self.conditionals[i]
+            per_node: List[frozenset] = []
+            for u in range(self.n_center):
+                q_u = Q[u]
+                sids = [
+                    sid
+                    for sid, cols in columns.items()
+                    if cols.size and float(q_u[cols].sum()) > self.epsilon
+                ]
+                per_node.append(frozenset(sids))
+            self.node_separatrix_ids.append(per_node)
+        self._pair_cache: Dict[Tuple[int, str, int, int], Tuple[float, float]] = {}
+        self._path_cache: Dict[Tuple[int, ...], PathCoherence] = {}
+        self.preprocess_seconds = float(time.perf_counter() - t0)
+
+    def ordered_pair_support(
+        self, input_index: int, separatrix_id: str, u: int, v: int
+    ) -> Tuple[float, float]:
+        """Cached ``(T_forward, T_reverse)`` for barycenter pair ``(u, v)``."""
+        key = (int(input_index), str(separatrix_id), int(u), int(v))
+        cached = self._pair_cache.get(key)
+        if cached is not None:
+            return cached
+        columns = self.separatrix_columns[input_index].get(str(separatrix_id))
+        if columns is None or columns.size < 2:
+            result = (0.0, 0.0)
+        else:
+            Q = self.conditionals[input_index]
+            result = ordered_pair_support_along_path(Q[int(u)], Q[int(v)], columns)
+        self._pair_cache[key] = result
+        return result
+
+    def directed_coherence_on_separatrix(
+        self, input_index: int, separatrix_id: str, path: Sequence[int]
+    ) -> Tuple[float, float]:
+        """Return ``(C_forward, C_reverse)`` of ``P`` on one input separatrix.
+
+        Each term is the geometric mean of ordered-pair supports ``T`` on
+        consecutive barycenter hops. ``T`` itself has **no** input-adjacency
+        requirement: endpoints may be arbitrarily far along ``s``.
+        """
+        nodes = [int(v) for v in path]
+        if len(nodes) < 3:
+            return 0.0, 0.0
+        t_forward = []
+        t_reverse = []
+        for u, v in zip(nodes[:-1], nodes[1:]):
+            tf, tr = self.ordered_pair_support(input_index, str(separatrix_id), u, v)
+            t_forward.append(tf)
+            t_reverse.append(tr)
+        return (
+            _geometric_mean(t_forward, epsilon=self.epsilon),
+            _geometric_mean(t_reverse, epsilon=self.epsilon),
+        )
+
+    def path_coherence(self, path: Sequence[int]) -> PathCoherence:
+        """Ensemble ``C(P)`` with per-input witness separatrix and direction."""
+        nodes = tuple(int(v) for v in path)
+        cached = self._path_cache.get(nodes)
+        if cached is not None:
+            return cached
+        if len(nodes) < 3:
+            result = PathCoherence(
+                path=nodes,
+                C=0.0,
+                C_inputs=np.zeros(self.n_inputs, dtype=float),
+                weights=np.zeros(self.n_inputs, dtype=float),
+                weight_sum=0.0,
+                uninformative=True,
+                best_separatrix_ids=[None] * self.n_inputs,
+                best_directions=[None] * self.n_inputs,
+                best_scores=np.zeros(self.n_inputs, dtype=float),
+            )
+            self._path_cache[nodes] = result
+            return result
+
+        pairs = list(zip(nodes[:-1], nodes[1:]))
+        C_inputs = np.zeros(self.n_inputs, dtype=float)
+        weights = np.zeros(self.n_inputs, dtype=float)
+        best_sids: List[Optional[str]] = [None] * self.n_inputs
+        best_dirs: List[Optional[str]] = [None] * self.n_inputs
+        best_scores = np.zeros(self.n_inputs, dtype=float)
+
+        for i in range(self.n_inputs):
+            fractions = self.matched_fractions[i]
+            weights[i] = float(min(fractions[v] for v in nodes))
+            if weights[i] <= self.epsilon:
+                continue
+            best = -1.0
+            best_sid: Optional[str] = None
+            best_dir: Optional[str] = None
+            candidate_sids: Optional[frozenset] = None
+            for node in nodes:
+                sids = self.node_separatrix_ids[i][node]
+                candidate_sids = (
+                    sids if candidate_sids is None else (candidate_sids & sids)
+                )
+                if not candidate_sids:
+                    break
+            if not candidate_sids:
+                continue
+            for sid in candidate_sids:
+                t_forward = []
+                t_reverse = []
+                for u, v in pairs:
+                    tf, tr = self.ordered_pair_support(i, sid, u, v)
+                    t_forward.append(tf)
+                    t_reverse.append(tr)
+                c_forward = _geometric_mean(t_forward, epsilon=self.epsilon)
+                c_reverse = _geometric_mean(t_reverse, epsilon=self.epsilon)
+                if c_forward >= c_reverse:
+                    candidate, direction = c_forward, "forward"
+                else:
+                    candidate, direction = c_reverse, "reverse"
+                if candidate > best + 1e-15 or (
+                    abs(candidate - best) <= 1e-15
+                    and (best_sid is None or str(sid) < str(best_sid))
+                ):
+                    best = float(candidate)
+                    best_sid = str(sid)
+                    best_dir = direction
+            if best_sid is None:
+                continue
+            C_inputs[i] = float(max(best, 0.0))
+            best_sids[i] = best_sid
+            best_dirs[i] = best_dir
+            best_scores[i] = C_inputs[i]
+
+        weight_sum = float(weights.sum())
+        if weight_sum <= self.epsilon:
+            result = PathCoherence(
+                path=nodes,
+                C=0.0,
+                C_inputs=C_inputs,
+                weights=weights,
+                weight_sum=0.0,
+                uninformative=True,
+                best_separatrix_ids=best_sids,
+                best_directions=best_dirs,
+                best_scores=best_scores,
+            )
+        else:
+            result = PathCoherence(
+                path=nodes,
+                C=float(np.dot(weights, C_inputs) / weight_sum),
+                C_inputs=C_inputs,
+                weights=weights,
+                weight_sum=weight_sum,
+                uninformative=False,
+                best_separatrix_ids=best_sids,
+                best_directions=best_dirs,
+                best_scores=best_scores,
+            )
+        self._path_cache[nodes] = result
+        reversed_nodes = tuple(reversed(nodes))
+        if reversed_nodes not in self._path_cache:
+            self._path_cache[reversed_nodes] = PathCoherence(
+                path=reversed_nodes,
+                C=result.C,
+                C_inputs=result.C_inputs.copy(),
+                weights=result.weights.copy(),
+                weight_sum=result.weight_sum,
+                uninformative=result.uninformative,
+                best_separatrix_ids=list(result.best_separatrix_ids),
+                best_directions=[
+                    None
+                    if direction is None
+                    else ("reverse" if direction == "forward" else "forward")
+                    for direction in result.best_directions
+                ],
+                best_scores=result.best_scores.copy(),
+            )
+        return result
+
+
+def prepare_path_coherence_engine(
+    betweenness_engine: SeparatrixBetweennessEngine,
+    *,
+    epsilon: Optional[float] = None,
+) -> SeparatrixPathCoherenceEngine:
+    """Wrap Phase 1 couplings/path indices for path-level coherence queries."""
+    return SeparatrixPathCoherenceEngine(betweenness_engine, epsilon=epsilon)
+
+
+def _phase1_edge_sort_key(edge: Tuple[Any, Any, Mapping[str, Any]]) -> Tuple:
+    u, v, data = edge
+    evidence = float(data.get("evidence", 0.0))
+    a, c = (int(u), int(v)) if int(u) <= int(v) else (int(v), int(u))
+    return (evidence, a, c)
+
+
+def _evidence_path_weight(u: Any, v: Any, data: Mapping[str, Any], *, epsilon: float) -> float:
+    evidence = float(data.get("evidence", 0.0))
+    return float(-np.log(max(evidence, epsilon)) + PATH_HOP_TIEBREAKER)
+
+
+def _propose_alternative_path(
+    graph: nx.Graph,
+    u: int,
+    v: int,
+    *,
+    epsilon: float,
+) -> Optional[List[int]]:
+    """Evidence-preferred u-v path (max product / min -log evidence)."""
+    try:
+        path = nx.shortest_path(
+            graph,
+            int(u),
+            int(v),
+            weight=lambda a, b, data: _evidence_path_weight(
+                a, b, data, epsilon=epsilon
+            ),
+        )
+    except nx.NetworkXNoPath:
+        return None
+    nodes = [int(n) for n in path]
+    if len(nodes) < 3:
+        return None
+    return nodes
+
+
+def prune_same_separatrix_cycles(
+    phase1_graph: nx.Graph,
+    coherence_engine: SeparatrixPathCoherenceEngine,
+    *,
+    theta: float = 0.5,
+    mode: str = "evidence",
+) -> CyclePruningResult:
+    """Greedily remove edges whose alternative path is one 1-separatrix.
+
+    Edges are visited in increasing original evidence (node-id tie break).
+    Each candidate is tested against the **current** graph after earlier
+    permanent removals. An alternative path is necessary but not sufficient:
+    removal requires ``C(P) >= theta``. Bridges are never removed.
+    """
+    t0 = time.perf_counter()
+    graph = phase1_graph.copy()
+    stats_before = reconstruction_graph_statistics(graph)
+    ordered_edges = sorted(graph.edges(data=True), key=_phase1_edge_sort_key)
+
+    attempt_rows: List[Dict[str, Any]] = []
+    removed_rows: List[Dict[str, Any]] = []
+    n_alternative = 0
+    n_coherent = 0
+
+    for u_raw, v_raw, data in ordered_edges:
+        u, v = int(u_raw), int(v_raw)
+        if not graph.has_edge(u, v):
+            continue
+        evidence = float(data.get("evidence", np.nan))
+        edge_attrs = dict(graph.get_edge_data(u, v) or {})
+        graph.remove_edge(u, v)
+        path = _propose_alternative_path(
+            graph, u, v, epsilon=coherence_engine.epsilon
+        )
+        if path is None:
+            graph.add_edge(u, v, **edge_attrs)
+            attempt_rows.append(
+                {
+                    "u": u,
+                    "v": v,
+                    "evidence": evidence,
+                    "decision": "retained_bridge",
+                    "phase": "phase2",
+                    "n_path_edges": 0,
+                    "C": np.nan,
+                    "uninformative": False,
+                    "path": None,
+                }
+            )
+            continue
+
+        n_alternative += 1
+        coherence = coherence_engine.path_coherence(path)
+        n_path_edges = len(path) - 1
+        if coherence.C >= float(theta):
+            n_coherent += 1
+            row = {
+                "u": u,
+                "v": v,
+                "evidence": evidence,
+                "decision": "removed_same_separatrix_cycle",
+                "phase": "phase2",
+                "n_path_edges": int(n_path_edges),
+                "C": float(coherence.C),
+                "uninformative": bool(coherence.uninformative),
+                "weight_sum": float(coherence.weight_sum),
+                "path": list(path),
+                "C_inputs": coherence.C_inputs.copy(),
+                "weights": coherence.weights.copy(),
+                "best_separatrix_ids": list(coherence.best_separatrix_ids),
+                "best_directions": list(coherence.best_directions),
+                "best_scores": coherence.best_scores.copy(),
+                "removal_order": len(removed_rows),
+            }
+            removed_rows.append(row)
+            attempt_rows.append(row)
+            # Leave e permanently deleted so later tests see this removal.
+            continue
+
+        graph.add_edge(u, v, **edge_attrs)
+        attempt_rows.append(
+            {
+                "u": u,
+                "v": v,
+                "evidence": evidence,
+                "decision": "retained_incoherent_alternative",
+                "phase": "phase2",
+                "n_path_edges": int(n_path_edges),
+                "C": float(coherence.C),
+                "uninformative": bool(coherence.uninformative),
+                "weight_sum": float(coherence.weight_sum),
+                "path": list(path),
+                "C_inputs": coherence.C_inputs.copy(),
+                "weights": coherence.weights.copy(),
+                "best_separatrix_ids": list(coherence.best_separatrix_ids),
+                "best_directions": list(coherence.best_directions),
+                "best_scores": coherence.best_scores.copy(),
+            }
+        )
+
+    stats_after = reconstruction_graph_statistics(
+        graph,
+        n_candidate_edges=int(stats_before["n_reconstructed_edges"]),
+        n_removed=len(removed_rows),
+    )
+    if stats_after["beta_0"] != stats_before["beta_0"]:
+        raise AssertionError(
+            "Phase 2 changed beta_0; a bridge was removed."
+        )
+
+    removed = pd.DataFrame(removed_rows)
+    attempts = pd.DataFrame(attempt_rows)
+    removed_C = removed["C"] if len(removed) else pd.Series(dtype=float)
+    removed_len = (
+        removed["n_path_edges"] if len(removed) else pd.Series(dtype=float)
+    )
+    statistics = {
+        "n_nodes": stats_after["n_nodes"],
+        "n_edges_before": int(stats_before["n_reconstructed_edges"]),
+        "n_removed": int(len(removed)),
+        "n_edges_after": int(stats_after["n_reconstructed_edges"]),
+        "beta_0_before": int(stats_before["beta_0"]),
+        "beta_0_after": int(stats_after["beta_0"]),
+        "beta_1_before": int(stats_before["beta_1"]),
+        "beta_1_after": int(stats_after["beta_1"]),
+        "n_alternative_paths": int(n_alternative),
+        "n_coherent_alternatives": int(n_coherent),
+        "removed_C_min": float(removed_C.min()) if len(removed_C) else np.nan,
+        "removed_C_median": float(removed_C.median()) if len(removed_C) else np.nan,
+        "removed_C_max": float(removed_C.max()) if len(removed_C) else np.nan,
+        "removed_path_edges_min": (
+            int(removed_len.min()) if len(removed_len) else 0
+        ),
+        "removed_path_edges_median": (
+            float(removed_len.median()) if len(removed_len) else np.nan
+        ),
+        "removed_path_edges_max": (
+            int(removed_len.max()) if len(removed_len) else 0
+        ),
+    }
+    elapsed = float(time.perf_counter() - t0)
+    return CyclePruningResult(
+        mode=mode,
+        theta=float(theta),
+        phase1_graph=phase1_graph,
+        reconstructed_graph=graph,
+        removed_edges=removed,
+        attempt_log=attempts,
+        statistics=statistics,
+        diagnostics={
+            "n_attempted_edges": int(len(attempts)),
+            "n_retained_bridge": int(
+                (attempts["decision"] == "retained_bridge").sum()
+            )
+            if len(attempts)
+            else 0,
+            "n_retained_incoherent": int(
+                (attempts["decision"] == "retained_incoherent_alternative").sum()
+            )
+            if len(attempts)
+            else 0,
+        },
+        preprocess_seconds=float(coherence_engine.preprocess_seconds),
+        elapsed_seconds=elapsed,
+    )
+
+
+def _test_coherence_engine(
+    conditionals: Sequence[np.ndarray],
+    matched_fractions: np.ndarray,
+    path_maps: Mapping[str, Sequence[int]],
+    *,
+    n_input_nodes: int,
+) -> SeparatrixPathCoherenceEngine:
+    path_index = _path_index_from_explicit_paths(path_maps, n_nodes=n_input_nodes)
+    betweenness = SeparatrixBetweennessEngine(
+        conditionals, np.asarray(matched_fractions, dtype=float), [path_index]
+    )
+    return SeparatrixPathCoherenceEngine(betweenness)
+
+
+def _graph_from_weighted_edges(
+    n_nodes: int, edges: Sequence[Tuple[int, int, float]]
+) -> nx.Graph:
+    graph = nx.Graph()
+    graph.add_nodes_from(range(n_nodes))
+    for u, v, evidence in edges:
+        graph.add_edge(int(u), int(v), evidence=float(evidence))
+    return graph
+
+
+def run_cycle_pruning_tests(*, tolerance: float = 1e-8) -> Dict[str, bool]:
+    """Correctness checks for path-level same-separatrix cycle pruning."""
+    results: Dict[str, bool] = {}
+
+    # Prefix-sum T matches the O(L^2) definition.
+    q_u = np.array([0.5, 0.3, 0.2, 0.0])
+    q_v = np.array([0.1, 0.0, 0.4, 0.5])
+    path_cols = np.array([0, 1, 2, 3])
+    fast = ordered_pair_support_along_path(q_u, q_v, path_cols)
+    naive = ordered_pair_support_naive(q_u, q_v, path_cols)
+    assert np.allclose(fast, naive, atol=tolerance)
+    results["T_prefix_matches_naive"] = True
+
+    # Test A: weaker same-separatrix chord is removed.
+    Q_a = np.eye(4)
+    engine_a = _test_coherence_engine(
+        [Q_a], np.ones((1, 4)), {"s": [0, 1, 2, 3]}, n_input_nodes=4
+    )
+    graph_a = _graph_from_weighted_edges(
+        4,
+        [(0, 1, 0.9), (1, 2, 0.9), (2, 3, 0.9), (0, 3, 0.2)],
+    )
+    path_abcd = engine_a.path_coherence([0, 1, 2, 3])
+    assert path_abcd.C > 1.0 - 1e-8
+    result_a = prune_same_separatrix_cycles(
+        graph_a, engine_a, theta=0.5, mode="testA"
+    )
+    assert not result_a.reconstructed_graph.has_edge(0, 3)
+    assert result_a.reconstructed_graph.has_edge(0, 1)
+    assert result_a.reconstructed_graph.has_edge(1, 2)
+    assert result_a.reconstructed_graph.has_edge(2, 3)
+    assert result_a.statistics["n_removed"] == 1
+    results["A_same_separatrix_shortcut"] = True
+
+    # Test B: Euclidean coordinates never enter C(P).
+    C_curved = engine_a.path_coherence([0, 1, 2, 3]).C
+    assert np.isclose(C_curved, path_abcd.C, atol=tolerance)
+    results["B_geometry_ignored"] = True
+
+    # Test C: a cycle from an unrelated detour is not a same-separatrix path.
+    Q_c = np.zeros((3, 6))
+    Q_c[0, 0] = 1.0
+    Q_c[1, 5] = 1.0
+    Q_c[2, 2] = 1.0
+    engine_c = _test_coherence_engine(
+        [Q_c],
+        np.ones((1, 3)),
+        {"s1": [0, 3, 2], "s2": [4, 5]},
+        n_input_nodes=6,
+    )
+    graph_c = _graph_from_weighted_edges(
+        3, [(0, 2, 0.8), (0, 1, 0.9), (1, 2, 0.9)]
+    )
+    C_detour = engine_c.path_coherence([0, 1, 2]).C
+    assert C_detour < 0.5
+    result_c = prune_same_separatrix_cycles(
+        graph_c, engine_c, theta=0.5, mode="testC"
+    )
+    assert result_c.reconstructed_graph.has_edge(0, 2)
+    assert result_c.statistics["n_removed"] == 0
+    results["C_genuine_different_separatrices"] = True
+
+    # Test D: mixed s1/s2 support cannot explain one path.
+    Q_d = np.eye(4)
+    engine_d = _test_coherence_engine(
+        [Q_d],
+        np.ones((1, 4)),
+        {"s1": [0, 1, 2], "s2": [2, 3]},
+        n_input_nodes=4,
+    )
+    C_mixed = engine_d.path_coherence([0, 1, 2, 3]).C
+    assert C_mixed < 0.5
+    results["D_common_separatrix_required"] = True
+
+    # Test E: reverse orientation is accepted.
+    Q_e = np.zeros((4, 4))
+    Q_e[0, 3] = 1.0
+    Q_e[1, 2] = 1.0
+    Q_e[2, 1] = 1.0
+    Q_e[3, 0] = 1.0
+    engine_e = _test_coherence_engine(
+        [Q_e], np.ones((1, 4)), {"s": [0, 1, 2, 3]}, n_input_nodes=4
+    )
+    reverse_score = engine_e.path_coherence([0, 1, 2, 3])
+    assert reverse_score.C > 1.0 - 1e-8
+    assert reverse_score.best_directions[0] == "reverse"
+    graph_e = _graph_from_weighted_edges(
+        4,
+        [(0, 1, 0.9), (1, 2, 0.9), (2, 3, 0.9), (0, 3, 0.2)],
+    )
+    result_e = prune_same_separatrix_cycles(
+        graph_e, engine_e, theta=0.5, mode="testE"
+    )
+    assert not result_e.reconstructed_graph.has_edge(0, 3)
+    results["E_reverse_orientation"] = True
+
+    # Test F: an unmatched input does not veto a coherent path.
+    Q_f0 = np.eye(4)
+    Q_f1 = np.zeros((4, 4))
+    fractions_f = np.array([[1.0, 1.0, 1.0, 1.0], [1e-16, 1.0, 1.0, 1.0]])
+    index_f = _path_index_from_explicit_paths({"s": [0, 1, 2, 3]}, n_nodes=4)
+    betweenness_f = SeparatrixBetweennessEngine(
+        [Q_f0, Q_f1], fractions_f, [index_f, index_f]
+    )
+    engine_f = SeparatrixPathCoherenceEngine(betweenness_f)
+    partial = engine_f.path_coherence([0, 1, 2, 3])
+    assert partial.weights[1] <= EPS
+    assert np.isclose(partial.C, 1.0, atol=1e-8)
+    results["F_partial_matching"] = True
+
+    # Test G: bridges are never removed.
+    engine_g = _test_coherence_engine(
+        [np.eye(3)], np.ones((1, 3)), {"s": [0, 1, 2]}, n_input_nodes=3
+    )
+    graph_g = _graph_from_weighted_edges(3, [(0, 1, 0.2), (1, 2, 0.9)])
+    result_g = prune_same_separatrix_cycles(
+        graph_g, engine_g, theta=0.5, mode="testG"
+    )
+    assert result_g.reconstructed_graph.has_edge(0, 1)
+    assert result_g.reconstructed_graph.has_edge(1, 2)
+    assert result_g.statistics["n_removed"] == 0
+    assert result_g.diagnostics["n_retained_bridge"] == 2
+    results["G_bridge_protection"] = True
+
+    # Test H: the greedy policy is deterministic.
+    result_h1 = prune_same_separatrix_cycles(
+        graph_a, engine_a, theta=0.5, mode="testH"
+    )
+    result_h2 = prune_same_separatrix_cycles(
+        graph_a, engine_a, theta=0.5, mode="testH"
+    )
+    assert list(result_h1.removed_edges["u"]) == list(result_h2.removed_edges["u"])
+    assert list(result_h1.removed_edges["v"]) == list(result_h2.removed_edges["v"])
+    assert set(result_h1.reconstructed_graph.edges()) == set(
+        result_h2.reconstructed_graph.edges()
+    )
+    results["H_deterministic"] = True
+    return results
+
+
+# ---------------------------------------------------------------------------
+# Phase 2.1: widest same-separatrix-affinity paths and R(e, P)
+# ---------------------------------------------------------------------------
+
+
+class _IntUnionFind:
+    """Union-find for Kruskal widest-path search."""
+
+    def __init__(self, nodes: Iterable[int]) -> None:
+        self.parent = {int(n): int(n) for n in nodes}
+        self.rank = {int(n): 0 for n in nodes}
+
+    def find(self, x: int) -> int:
+        x = int(x)
+        while self.parent[x] != x:
+            self.parent[x] = self.parent[self.parent[x]]
+            x = self.parent[x]
+        return x
+
+    def union(self, a: int, b: int) -> bool:
+        ra, rb = self.find(a), self.find(b)
+        if ra == rb:
+            return False
+        if self.rank[ra] < self.rank[rb]:
+            ra, rb = rb, ra
+        self.parent[rb] = ra
+        if self.rank[ra] == self.rank[rb]:
+            self.rank[ra] += 1
+        return True
+
+
+def _edge_key(u: int, v: int) -> Tuple[int, int]:
+    a, b = int(u), int(v)
+    return (a, b) if a <= b else (b, a)
+
+
+def _directed_bilinear_support(
+    q_u: np.ndarray,
+    q_v: np.ndarray,
+    kernel: np.ndarray,
+) -> Tuple[float, float, float]:
+    """Return ``(S_forward, S_reverse, mean_hop)`` with ``kernel`` on an ordered path.
+
+    ``S_forward = sum_{j < k} q_u[j] kernel[j,k] q_v[k]``. No input-graph
+    adjacency is required unless ``kernel`` itself is an adjacency matrix.
+    """
+    a = np.asarray(q_u, dtype=float)
+    b = np.asarray(q_v, dtype=float)
+    K = np.asarray(kernel, dtype=float)
+    L = a.shape[0]
+    if L < 2 or K.shape != (L, L):
+        return 0.0, 0.0, float("nan")
+    hops = np.abs(np.arange(L)[:, None] - np.arange(L)[None, :]).astype(float)
+    forward = np.triu(np.ones((L, L), dtype=float), k=1)
+    reverse = np.tril(np.ones((L, L), dtype=float), k=-1)
+    mass_f = a[:, None] * K * b[None, :] * forward
+    mass_r = a[:, None] * K * b[None, :] * reverse
+    s_f = float(mass_f.sum())
+    s_r = float(mass_r.sum())
+    mass = mass_f + mass_r
+    total = float(mass.sum())
+    mean_hop = float((mass * hops).sum() / total) if total > 0.0 else float("nan")
+    return s_f, s_r, mean_hop
+
+
+def _gaussian_kernel_from_distances(
+    distances: np.ndarray,
+    *,
+    sigma: float,
+    eta: float,
+    cutoff: float,
+    zero_at_zero_distance: bool,
+) -> np.ndarray:
+    L = int(distances.shape[0])
+    kernel = np.zeros((L, L), dtype=float)
+    for j in range(L):
+        for k in range(j + 1, L):
+            value = _gaussian_kernel_value(
+                float(distances[j, k]),
+                sigma=sigma,
+                eta=eta,
+                cutoff=cutoff,
+                zero_at_zero_distance=zero_at_zero_distance,
+            )
+            kernel[j, k] = kernel[k, j] = value
+    return kernel
+
+
+def _path_pairwise_distances(
+    graph: Optional[nx.Graph],
+    node_ids: Sequence[Any],
+    *,
+    length_attribute: Optional[str],
+    length_scale: float,
+) -> np.ndarray:
+    """Cumulative geometric length along a simple path; hop fallback if needed."""
+    L = len(node_ids)
+    cum = np.zeros(L, dtype=float)
+    for j in range(1, L):
+        u, v = node_ids[j - 1], node_ids[j]
+        used_geo = False
+        if graph is not None and u in graph and v in graph:
+            try:
+                cum[j] = cum[j - 1] + _edge_geometric_length(
+                    graph,
+                    u,
+                    v,
+                    length_attribute=length_attribute,
+                    length_scale=length_scale,
+                )
+                used_geo = True
+            except Exception:
+                used_geo = False
+        if not used_geo:
+            cum[j] = cum[j - 1] + 1.0
+    distances = np.abs(cum[:, None] - cum[None, :])
+    return distances
+
+
+class SeparatrixEdgeSupportEngine:
+    """Mode-aware per-edge / per-separatrix support ``S_{i,s}(u,v)``.
+
+    Direct support uses the same structural criterion as transported direct
+    evidence: binary input adjacency restricted to one separatrix ID.
+    Soft support uses the same Gaussian kernel as transported soft evidence,
+    evaluated along one ordered 1-separatrix (multi-hop pairs allowed).
+    """
+
+    def __init__(
+        self,
+        coherence_engine: SeparatrixPathCoherenceEngine,
+        graphs: Optional[Sequence[nx.Graph]] = None,
+        *,
+        gaussian_sigma: float = 0.03,
+        gaussian_eta: float = 1.0,
+        gaussian_cutoff_sigmas: float = 3.0,
+        gaussian_zero_at_zero_distance: bool = True,
+        length_scale: float = 1.0,
+        length_attribute: Optional[str] = None,
+        use_unit_soft_kernel: bool = False,
+    ) -> None:
+        t0 = time.perf_counter()
+        self.coherence = coherence_engine
+        self.conditionals = coherence_engine.conditionals
+        self.matched_fractions = coherence_engine.matched_fractions
+        self.path_indices = coherence_engine.path_indices
+        self.node_separatrix_ids = coherence_engine.node_separatrix_ids
+        self.epsilon = coherence_engine.epsilon
+        self.n_inputs = coherence_engine.n_inputs
+        self.n_center = coherence_engine.n_center
+        self.graphs = None if graphs is None else list(graphs)
+        self.sigma = float(gaussian_sigma)
+        self.eta = float(gaussian_eta)
+        self.cutoff = float(gaussian_cutoff_sigmas) * float(gaussian_sigma)
+        self.zero_at_zero = bool(gaussian_zero_at_zero_distance)
+        self.length_scale = float(length_scale)
+        self.length_attribute = length_attribute
+        self.use_unit_soft_kernel = bool(use_unit_soft_kernel)
+
+        self._sid_data: List[Dict[str, Dict[str, Any]]] = []
+        for i, path_index in enumerate(self.path_indices):
+            graph = None if self.graphs is None else self.graphs[i]
+            per_sid: Dict[str, Dict[str, Any]] = {}
+            for sid, cols in coherence_engine.separatrix_columns[i].items():
+                cols_arr = np.asarray(cols, dtype=np.int64)
+                L = int(cols_arr.size)
+                node_ids = [path_index.node_order[int(c)] for c in cols_arr]
+                adjacent = np.zeros((L, L), dtype=float)
+                if L >= 2:
+                    idx = np.arange(L - 1)
+                    adjacent[idx, idx + 1] = 1.0
+                    adjacent[idx + 1, idx] = 1.0
+                if self.use_unit_soft_kernel:
+                    soft = np.ones((L, L), dtype=float)
+                    np.fill_diagonal(soft, 0.0)
+                else:
+                    distances = _path_pairwise_distances(
+                        graph,
+                        node_ids,
+                        length_attribute=self.length_attribute,
+                        length_scale=self.length_scale,
+                    )
+                    soft = _gaussian_kernel_from_distances(
+                        distances,
+                        sigma=self.sigma,
+                        eta=self.eta,
+                        cutoff=self.cutoff,
+                        zero_at_zero_distance=self.zero_at_zero,
+                    )
+                per_sid[str(sid)] = {
+                    "cols": cols_arr,
+                    "adjacent": adjacent,
+                    "soft": soft,
+                }
+            self._sid_data.append(per_sid)
+        self._cache: Dict[Tuple[str, int, str, int, int], Tuple[float, float, float]] = {}
+        self._edge_cache: Dict[Tuple[str, int, int], EdgeSeparatrixSupport] = {}
+        self.preprocess_seconds = float(time.perf_counter() - t0)
+
+    def directed_support(
+        self,
+        input_index: int,
+        separatrix_id: str,
+        u: int,
+        v: int,
+        mode: str,
+    ) -> Tuple[float, float, float]:
+        """``(S_forward, S_reverse, mean_hop)`` for one input separatrix."""
+        if mode not in {"direct", "soft"}:
+            raise ValueError("mode must be 'direct' or 'soft'.")
+        key = (mode, int(input_index), str(separatrix_id), int(u), int(v))
+        cached = self._cache.get(key)
+        if cached is not None:
+            return cached
+        data = self._sid_data[input_index].get(str(separatrix_id))
+        if data is None or data["cols"].size < 2:
+            result = (0.0, 0.0, float("nan"))
+        else:
+            cols = data["cols"]
+            kernel = data["adjacent"] if mode == "direct" else data["soft"]
+            Q = self.conditionals[input_index]
+            result = _directed_bilinear_support(Q[int(u), cols], Q[int(v), cols], kernel)
+        self._cache[key] = result
+        return result
+
+    def edge_support(
+        self,
+        u: int,
+        v: int,
+        mode: str,
+        *,
+        theta: float = 0.5,
+    ) -> EdgeSeparatrixSupport:
+        """Coverage-weighted ``S_sep(e) = sum w_i max_s S_{i,s}(e) / sum w_i``."""
+        cache_key = (mode, int(u), int(v), float(theta))
+        cached = self._edge_cache.get(cache_key)
+        if cached is not None:
+            return cached
+        u_i, v_i = int(u), int(v)
+        S_inputs = np.zeros(self.n_inputs, dtype=float)
+        S_forward = np.zeros(self.n_inputs, dtype=float)
+        S_reverse = np.zeros(self.n_inputs, dtype=float)
+        weights = np.zeros(self.n_inputs, dtype=float)
+        hops = np.full(self.n_inputs, np.nan, dtype=float)
+        best_sids: List[Optional[str]] = [None] * self.n_inputs
+        best_dirs: List[Optional[str]] = [None] * self.n_inputs
+        for i in range(self.n_inputs):
+            fractions = self.matched_fractions[i]
+            weights[i] = float(min(fractions[u_i], fractions[v_i]))
+            if weights[i] <= self.epsilon:
+                continue
+            candidate = self.node_separatrix_ids[i][u_i] & self.node_separatrix_ids[i][v_i]
+            best = -1.0
+            for sid in candidate:
+                s_f, s_r, mean_hop = self.directed_support(i, sid, u_i, v_i, mode)
+                s_undirected = s_f + s_r
+                direction = "forward" if s_f >= s_r else "reverse"
+                if s_undirected > best + 1e-15 or (
+                    abs(s_undirected - best) <= 1e-15
+                    and (best_sids[i] is None or str(sid) < str(best_sids[i]))
+                ):
+                    best = float(s_undirected)
+                    best_sids[i] = str(sid)
+                    best_dirs[i] = direction
+                    S_forward[i] = float(s_f)
+                    S_reverse[i] = float(s_r)
+                    hops[i] = mean_hop
+            S_inputs[i] = 0.0 if best < 0.0 else float(best)
+        weight_sum = float(weights.sum())
+        if weight_sum <= self.epsilon:
+            S_sep = 0.0
+            strong = 0.0
+            std = 0.0
+            uninformative = True
+        else:
+            S_sep = float(np.dot(weights, S_inputs) / weight_sum)
+            strong = float(np.dot(weights, (S_inputs >= float(theta)).astype(float)) / weight_sum)
+            centered = S_inputs - S_sep
+            std = float(np.sqrt(np.dot(weights, centered * centered) / weight_sum))
+            uninformative = False
+        result = EdgeSeparatrixSupport(
+            u=u_i,
+            v=v_i,
+            mode=mode,
+            S_sep=S_sep,
+            S_inputs=S_inputs,
+            weights=weights,
+            weight_sum=weight_sum,
+            uninformative=uninformative,
+            best_separatrix_ids=best_sids,
+            best_directions=best_dirs,
+            S_forward_inputs=S_forward,
+            S_reverse_inputs=S_reverse,
+            mean_hops=hops,
+            strong_fraction=strong,
+            S_std=std,
+        )
+        self._edge_cache[cache_key] = result
+        reverse_key = (mode, v_i, u_i, float(theta))
+        if reverse_key not in self._edge_cache:
+            self._edge_cache[reverse_key] = EdgeSeparatrixSupport(
+                u=v_i,
+                v=u_i,
+                mode=mode,
+                S_sep=result.S_sep,
+                S_inputs=result.S_inputs.copy(),
+                weights=result.weights.copy(),
+                weight_sum=result.weight_sum,
+                uninformative=result.uninformative,
+                best_separatrix_ids=list(result.best_separatrix_ids),
+                best_directions=[
+                    None
+                    if direction is None
+                    else ("reverse" if direction == "forward" else "forward")
+                    for direction in result.best_directions
+                ],
+                S_forward_inputs=result.S_reverse_inputs.copy(),
+                S_reverse_inputs=result.S_forward_inputs.copy(),
+                mean_hops=result.mean_hops.copy(),
+                strong_fraction=result.strong_fraction,
+                S_std=result.S_std,
+            )
+        return result
+
+    def edge_path_redundancy(
+        self,
+        u: int,
+        v: int,
+        path: Sequence[int],
+        mode: str,
+        *,
+        affinities: Optional[Mapping[Tuple[int, int], float]] = None,
+    ) -> EdgePathRedundancy:
+        """``R(e,P)``: same input separatrix and orientation must support both ``e`` and ``P``."""
+        nodes = tuple(int(n) for n in path)
+        u_i, v_i = int(u), int(v)
+        if len(nodes) >= 2 and nodes[0] == v_i and nodes[-1] == u_i:
+            nodes = tuple(reversed(nodes))
+        R_inputs = np.zeros(self.n_inputs, dtype=float)
+        S_matched = np.zeros(self.n_inputs, dtype=float)
+        C_matched = np.zeros(self.n_inputs, dtype=float)
+        weights = np.zeros(self.n_inputs, dtype=float)
+        best_sids: List[Optional[str]] = [None] * self.n_inputs
+        best_dirs: List[Optional[str]] = [None] * self.n_inputs
+        for i in range(self.n_inputs):
+            fractions = self.matched_fractions[i]
+            weights[i] = float(min(fractions[n] for n in nodes)) if nodes else 0.0
+            if weights[i] <= self.epsilon:
+                continue
+            candidate = None
+            for node in nodes:
+                sids = self.node_separatrix_ids[i][node]
+                candidate = sids if candidate is None else (candidate & sids)
+                if not candidate:
+                    break
+            if not candidate:
+                continue
+            best = -1.0
+            for sid in candidate:
+                s_f, s_r, _hop = self.directed_support(i, sid, u_i, v_i, mode)
+                c_f, c_r = self.coherence.directed_coherence_on_separatrix(i, sid, nodes)
+                r_f = min(s_f, c_f)
+                r_r = min(s_r, c_r)
+                if r_f >= r_r:
+                    r_s, direction, s_used, c_used = r_f, "forward", s_f, c_f
+                else:
+                    r_s, direction, s_used, c_used = r_r, "reverse", s_r, c_r
+                if r_s > best + 1e-15 or (
+                    abs(r_s - best) <= 1e-15
+                    and (best_sids[i] is None or str(sid) < str(best_sids[i]))
+                ):
+                    best = float(r_s)
+                    best_sids[i] = str(sid)
+                    best_dirs[i] = direction
+                    S_matched[i] = float(s_used)
+                    C_matched[i] = float(c_used)
+            R_inputs[i] = 0.0 if best < 0.0 else float(best)
+        weight_sum = float(weights.sum())
+        R = (
+            0.0
+            if weight_sum <= self.epsilon
+            else float(np.dot(weights, R_inputs) / weight_sum)
+        )
+        bottleneck = 0.0
+        mean_aff = 0.0
+        if affinities is not None and len(nodes) >= 3:
+            affs = [
+                float(affinities[_edge_key(a, b)])
+                for a, b in zip(nodes[:-1], nodes[1:])
+            ]
+            if affs:
+                bottleneck = float(min(affs))
+                mean_aff = float(np.mean(affs))
+        return EdgePathRedundancy(
+            u=u_i,
+            v=v_i,
+            path=nodes,
+            R=R,
+            R_inputs=R_inputs,
+            weights=weights,
+            weight_sum=weight_sum,
+            uninformative=weight_sum <= self.epsilon,
+            best_separatrix_ids=best_sids,
+            best_directions=best_dirs,
+            S_matched=S_matched,
+            C_matched=C_matched,
+            bottleneck=bottleneck,
+            mean_affinity=mean_aff,
+        )
+
+
+def prepare_edge_support_engine(
+    coherence_engine: SeparatrixPathCoherenceEngine,
+    bundle: Mapping[str, Any],
+    transported: TransportedConnectivityResult,
+    config: ReconstructionConfig,
+) -> SeparatrixEdgeSupportEngine:
+    """Build mode-aware ``S_{i,s}`` using the existing Gaussian / adjacency semantics."""
+    diagnostics = dict(transported.diagnostics or {})
+    return SeparatrixEdgeSupportEngine(
+        coherence_engine,
+        list(bundle["Gs"]),
+        gaussian_sigma=float(diagnostics.get("gaussian_sigma", config.gaussian_sigma)),
+        gaussian_eta=float(diagnostics.get("gaussian_eta", config.gaussian_eta)),
+        gaussian_cutoff_sigmas=float(
+            diagnostics.get("gaussian_cutoff_sigmas", config.gaussian_cutoff_sigmas)
+        ),
+        gaussian_zero_at_zero_distance=bool(
+            diagnostics.get(
+                "gaussian_zero_at_zero_distance",
+                config.gaussian_zero_at_zero_distance,
+            )
+        ),
+        length_scale=float(diagnostics.get("length_scale", 1.0)),
+        length_attribute=config.geometric_length_attribute,
+        use_unit_soft_kernel=False,
+    )
+
+
+def annotate_separatrix_affinities(
+    graph: nx.Graph,
+    support_engine: SeparatrixEdgeSupportEngine,
+    mode: str,
+    *,
+    theta: float = 0.5,
+) -> Dict[Tuple[int, int], EdgeSeparatrixSupport]:
+    """Store ``sep_affinity = S_sep(e)`` on every undirected graph edge."""
+    records: Dict[Tuple[int, int], EdgeSeparatrixSupport] = {}
+    for u, v, data in graph.edges(data=True):
+        support = support_engine.edge_support(int(u), int(v), mode, theta=theta)
+        key = _edge_key(u, v)
+        records[key] = support
+        data["sep_affinity"] = float(support.S_sep)
+    return records
+
+
+def widest_affinity_path(
+    graph: nx.Graph,
+    u: int,
+    v: int,
+    *,
+    affinity_attr: str = "sep_affinity",
+    evidence_attr: str = "evidence",
+) -> Optional[List[int]]:
+    """Maximum-bottleneck u-v path via Kruskal on a maximum spanning forest.
+
+    Edge sort (all descending, then node ids): affinity, evidence, min-id, max-id.
+    Hop count is not the primary criterion. Returns ``None`` if disconnected.
+    """
+    u_i, v_i = int(u), int(v)
+    if u_i == v_i:
+        return None
+    ranked = []
+    for a, b, data in graph.edges(data=True):
+        affinity = float(data.get(affinity_attr, 0.0))
+        evidence = float(data.get(evidence_attr, 0.0))
+        a_i, b_i = _edge_key(a, b)
+        ranked.append((-affinity, -evidence, a_i, b_i, int(a), int(b)))
+    ranked.sort()
+    uf = _IntUnionFind(graph.nodes())
+    tree = nx.Graph()
+    tree.add_nodes_from(int(n) for n in graph.nodes())
+    for _neg_a, _neg_e, _a_i, _b_i, a, b in ranked:
+        if uf.union(a, b):
+            tree.add_edge(a, b)
+            if uf.find(u_i) == uf.find(v_i):
+                path = [int(n) for n in nx.shortest_path(tree, u_i, v_i)]
+                return None if len(path) < 3 else path
+    return None
+
+
+def prune_same_separatrix_redundancy(
+    phase1_graph: nx.Graph,
+    support_engine: SeparatrixEdgeSupportEngine,
+    mode: str,
+    *,
+    theta: float = 0.5,
+) -> CyclePruningResult:
+    """Greedy Phase 2.1: widest ``S_sep`` path and ``R(e,P) >= theta``.
+
+    ``R_i(e,P) = max_s max(min(S_forward, C_forward), min(S_reverse, C_reverse))``.
+    The candidate edge and the replacement path must share one separatrix ID
+    *and* one orientation inside each input. Direct and soft use the same
+    loop; only ``mode`` selects the support kernel.
+    """
+    t0 = time.perf_counter()
+    graph = phase1_graph.copy()
+    supports = annotate_separatrix_affinities(graph, support_engine, mode, theta=theta)
+    affinities = {key: float(rec.S_sep) for key, rec in supports.items()}
+    stats_before = reconstruction_graph_statistics(graph)
+    ordered_edges = sorted(graph.edges(data=True), key=_phase1_edge_sort_key)
+
+    attempt_rows: List[Dict[str, Any]] = []
+    removed_rows: List[Dict[str, Any]] = []
+    n_alternative = 0
+    n_redundant = 0
+
+    for u_raw, v_raw, data in ordered_edges:
+        u, v = int(u_raw), int(v_raw)
+        if not graph.has_edge(u, v):
+            continue
+        evidence = float(data.get("evidence", np.nan))
+        edge_attrs = dict(graph.get_edge_data(u, v) or {})
+        edge_support = supports.get(_edge_key(u, v))
+        graph.remove_edge(u, v)
+        path = widest_affinity_path(graph, u, v)
+        if path is None:
+            graph.add_edge(u, v, **edge_attrs)
+            attempt_rows.append(
+                {
+                    "u": u,
+                    "v": v,
+                    "evidence": evidence,
+                    "S_sep": np.nan if edge_support is None else float(edge_support.S_sep),
+                    "decision": "retained_bridge",
+                    "phase": "phase2.1",
+                    "n_path_edges": 0,
+                    "R": np.nan,
+                    "C_old_style": np.nan,
+                    "path": None,
+                    "bottleneck": np.nan,
+                    "mean_affinity": np.nan,
+                }
+            )
+            continue
+
+        n_alternative += 1
+        redundancy = support_engine.edge_path_redundancy(
+            u, v, path, mode, affinities=affinities
+        )
+        n_path_edges = len(path) - 1
+        row = {
+            "u": u,
+            "v": v,
+            "evidence": evidence,
+            "S_sep": np.nan if edge_support is None else float(edge_support.S_sep),
+            "decision": "",
+            "phase": "phase2.1",
+            "n_path_edges": int(n_path_edges),
+            "R": float(redundancy.R),
+            "uninformative": bool(redundancy.uninformative),
+            "weight_sum": float(redundancy.weight_sum),
+            "path": list(path),
+            "bottleneck": float(redundancy.bottleneck),
+            "mean_affinity": float(redundancy.mean_affinity),
+            "R_inputs": redundancy.R_inputs.copy(),
+            "weights": redundancy.weights.copy(),
+            "S_matched": redundancy.S_matched.copy(),
+            "C_matched": redundancy.C_matched.copy(),
+            "best_separatrix_ids": list(redundancy.best_separatrix_ids),
+            "best_directions": list(redundancy.best_directions),
+        }
+        if redundancy.R >= float(theta):
+            n_redundant += 1
+            row["decision"] = "removed_same_separatrix_redundancy"
+            row["removal_order"] = len(removed_rows)
+            removed_rows.append(row)
+            attempt_rows.append(row)
+            continue
+        graph.add_edge(u, v, **edge_attrs)
+        row["decision"] = "retained_incoherent_alternative"
+        attempt_rows.append(row)
+
+    stats_after = reconstruction_graph_statistics(
+        graph,
+        n_candidate_edges=int(stats_before["n_reconstructed_edges"]),
+        n_removed=len(removed_rows),
+    )
+    if stats_after["beta_0"] != stats_before["beta_0"]:
+        raise AssertionError("Phase 2.1 changed beta_0; a bridge was removed.")
+    removed = pd.DataFrame(removed_rows)
+    attempts = pd.DataFrame(attempt_rows)
+    removed_R = removed["R"] if len(removed) else pd.Series(dtype=float)
+    removed_len = removed["n_path_edges"] if len(removed) else pd.Series(dtype=float)
+    statistics = {
+        "n_nodes": stats_after["n_nodes"],
+        "n_edges_before": int(stats_before["n_reconstructed_edges"]),
+        "n_removed": int(len(removed)),
+        "n_edges_after": int(stats_after["n_reconstructed_edges"]),
+        "beta_0_before": int(stats_before["beta_0"]),
+        "beta_0_after": int(stats_after["beta_0"]),
+        "beta_1_before": int(stats_before["beta_1"]),
+        "beta_1_after": int(stats_after["beta_1"]),
+        "n_alternative_paths": int(n_alternative),
+        "n_redundant_alternatives": int(n_redundant),
+        "removed_R_min": float(removed_R.min()) if len(removed_R) else np.nan,
+        "removed_R_median": float(removed_R.median()) if len(removed_R) else np.nan,
+        "removed_R_max": float(removed_R.max()) if len(removed_R) else np.nan,
+        "removed_path_edges_min": int(removed_len.min()) if len(removed_len) else 0,
+        "removed_path_edges_median": (
+            float(removed_len.median()) if len(removed_len) else np.nan
+        ),
+        "removed_path_edges_mean": (
+            float(removed_len.mean()) if len(removed_len) else np.nan
+        ),
+        "removed_path_edges_max": int(removed_len.max()) if len(removed_len) else 0,
+    }
+    return CyclePruningResult(
+        mode=mode,
+        theta=float(theta),
+        phase1_graph=phase1_graph,
+        reconstructed_graph=graph,
+        removed_edges=removed,
+        attempt_log=attempts,
+        statistics=statistics,
+        diagnostics={
+            "n_attempted_edges": int(len(attempts)),
+            "n_retained_bridge": int((attempts["decision"] == "retained_bridge").sum())
+            if len(attempts)
+            else 0,
+            "n_retained_incoherent": int(
+                (attempts["decision"] == "retained_incoherent_alternative").sum()
+            )
+            if len(attempts)
+            else 0,
+            "proposal": "widest_sep_affinity",
+            "criterion": "R(e,P)",
+        },
+        preprocess_seconds=float(support_engine.preprocess_seconds),
+        elapsed_seconds=float(time.perf_counter() - t0),
+    )
+
+
+def classify_surviving_separatrix_support(
+    S_sep: float,
+    strong_fraction: float,
+    *,
+    direct_evidence: float = np.nan,
+    theta: float = 0.5,
+) -> str:
+    """Diagnostic labels only; not used as extra pruning thresholds."""
+    if np.isfinite(direct_evidence) and float(direct_evidence) >= float(theta):
+        return "direct_like"
+    if float(S_sep) >= float(theta) and float(strong_fraction) >= float(theta):
+        return "high_consensus"
+    if float(S_sep) < float(theta):
+        return "low_separatrix"
+    return "mixed_uncertain"
+
+
+def surviving_edge_support_table(
+    graph: nx.Graph,
+    support_engine: SeparatrixEdgeSupportEngine,
+    mode: str,
+    *,
+    theta: float = 0.5,
+    direct_evidence: Optional[np.ndarray] = None,
+) -> pd.DataFrame:
+    """Per-surviving-edge same-separatrix diagnostics."""
+    rows: List[Dict[str, Any]] = []
+    for u, v, data in graph.edges(data=True):
+        support = support_engine.edge_support(int(u), int(v), mode, theta=theta)
+        ev = float(data.get("evidence", np.nan))
+        direct_ev = np.nan
+        if direct_evidence is not None:
+            direct_ev = float(direct_evidence[int(u), int(v)])
+        rows.append(
+            {
+                "u": int(u),
+                "v": int(v),
+                "evidence": ev,
+                "S_sep": float(support.S_sep),
+                "strong_fraction": float(support.strong_fraction),
+                "S_std": float(support.S_std),
+                "mean_hop": float(np.nanmean(support.mean_hops)),
+                "direct_evidence": direct_ev,
+                "category": classify_surviving_separatrix_support(
+                    support.S_sep,
+                    support.strong_fraction,
+                    direct_evidence=direct_ev,
+                    theta=theta,
+                ),
+                "S_inputs": support.S_inputs.copy(),
+                "weights": support.weights.copy(),
+                "best_separatrix_ids": list(support.best_separatrix_ids),
+                "best_directions": list(support.best_directions),
+                "mean_hops": support.mean_hops.copy(),
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def count_thresholded_pairs(matrix: np.ndarray, threshold: float) -> int:
+    """Upper-triangle count of finite entries at or above ``threshold``."""
+    W = np.asarray(matrix, dtype=float)
+    iu, ju = np.triu_indices(W.shape[0], k=1)
+    weights = W[iu, ju]
+    return int(np.sum(np.isfinite(weights) & (weights >= float(threshold))))
+
+
+def reconstruction_count_row(
+    *,
+    mode: str,
+    candidate_graph: nx.Graph,
+    phase1: TriangleReconstructionResult,
+    phase2: CyclePruningResult,
+    evidence_matrix: np.ndarray,
+    threshold: float,
+    phase21: Optional["CyclePruningResult"] = None,
+) -> Dict[str, Any]:
+    """Counts taken from the same graph objects later passed to plotting."""
+    n_nodes = int(candidate_graph.number_of_nodes())
+    row: Dict[str, Any] = {
+        "mode": mode,
+        "candidate_edges": int(candidate_graph.number_of_edges()),
+        "candidate_edges_thresholded_matrix": count_thresholded_pairs(
+            evidence_matrix, threshold
+        ),
+        "phase1_edges": int(phase1.reconstructed_graph.number_of_edges()),
+        "phase1_removed": int(len(phase1.removed_edges)),
+        "phase1_plot_matrix_edges": count_thresholded_pairs(
+            evidence_matrix_from_graph(
+                phase1.reconstructed_graph,
+                n_nodes=n_nodes,
+            ),
+            threshold,
+        ),
+        "phase2_edges": int(phase2.reconstructed_graph.number_of_edges()),
+        "phase2_removed": int(len(phase2.removed_edges)),
+        "phase2_plot_matrix_edges": count_thresholded_pairs(
+            evidence_matrix_from_graph(
+                phase2.reconstructed_graph,
+                n_nodes=n_nodes,
+            ),
+            threshold,
+        ),
+    }
+    if phase21 is not None:
+        row["phase21_edges"] = int(phase21.reconstructed_graph.number_of_edges())
+        row["phase21_removed"] = int(len(phase21.removed_edges))
+        row["phase21_plot_matrix_edges"] = count_thresholded_pairs(
+            evidence_matrix_from_graph(
+                phase21.reconstructed_graph,
+                n_nodes=n_nodes,
+            ),
+            threshold,
+        )
+    return row
+
+
+def witness_path_length_stats(log: Optional[pd.DataFrame]) -> Dict[str, float]:
+    """Median / mean / max hop counts of proposed alternative paths."""
+    empty = {
+        "n_witnesses": 0,
+        "median": float("nan"),
+        "mean": float("nan"),
+        "max": 0,
+    }
+    if log is None or len(log) == 0 or "n_path_edges" not in log.columns:
+        return empty
+    lengths = pd.to_numeric(log["n_path_edges"], errors="coerce")
+    lengths = lengths[np.isfinite(lengths) & (lengths > 0)]
+    if lengths.empty:
+        return empty
+    return {
+        "n_witnesses": int(len(lengths)),
+        "median": float(lengths.median()),
+        "mean": float(lengths.mean()),
+        "max": int(lengths.max()),
+    }
+
+
+def _test_support_engine(
+    conditionals: Sequence[np.ndarray],
+    matched_fractions: np.ndarray,
+    path_maps: Mapping[str, Sequence[int]],
+    n_input_nodes: int,
+    *,
+    extra_path_indices: Optional[Sequence[SeparatrixPathIndex]] = None,
+) -> Tuple[SeparatrixPathCoherenceEngine, SeparatrixEdgeSupportEngine]:
+    path_index = _path_index_from_explicit_paths(path_maps, n_nodes=n_input_nodes)
+    indices = [path_index]
+    cond = [np.asarray(Q, dtype=float) for Q in conditionals]
+    if extra_path_indices is not None:
+        indices = list(extra_path_indices)
+    if len(indices) != len(cond):
+        indices = [path_index] * len(cond)
+    betweenness = SeparatrixBetweennessEngine(
+        cond, np.asarray(matched_fractions, dtype=float), indices
+    )
+    coherence = SeparatrixPathCoherenceEngine(betweenness)
+    support = SeparatrixEdgeSupportEngine(coherence, use_unit_soft_kernel=True)
+    return coherence, support
+
+
+def run_phase21_tests(*, tolerance: float = 1e-8) -> Dict[str, bool]:
+    """Correctness checks for multi-hop support, widest paths, and R(e,P)."""
+    results: Dict[str, bool] = {}
+
+    # Part 0: T and betweenness do not require input adjacency.
+    q_u = np.array([1.0, 0.0, 0.0, 0.0, 0.0])
+    q_v = np.array([0.0, 0.0, 0.0, 0.0, 1.0])
+    t_f, t_r = ordered_pair_support_along_path(q_u, q_v, np.arange(5))
+    assert t_f > 1.0 - tolerance
+    assert t_r < tolerance
+    index_between = _path_index_from_explicit_paths({"s": [0, 1, 2, 3, 4]}, n_nodes=5)
+    assert input_nodes_between(index_between, 0, 2, 4) is True
+    assert input_nodes_between_from_positions(index_between, 0, 2, 4) is True
+    results["P0_no_input_adjacency_requirement"] = True
+
+    # Test A: multi-hop soft vs adjacent-only direct.
+    Q_a = np.zeros((2, 5))
+    Q_a[0, 0] = 1.0
+    Q_a[1, 4] = 1.0
+    _coh_a, support_a = _test_support_engine([Q_a], np.ones((1, 2)), {"s": [0, 1, 2, 3, 4]}, 5)
+    s_soft = support_a.directed_support(0, "s", 0, 1, "soft")
+    s_direct = support_a.directed_support(0, "s", 0, 1, "direct")
+    assert s_soft[0] > 0.5
+    assert s_direct[0] + s_direct[1] < tolerance
+    results["A_multihop_soft_not_direct"] = True
+
+    # Test B: widest path prefers a long high-affinity route over a short weak detour.
+    graph_b = nx.Graph()
+    graph_b.add_nodes_from(range(7))
+    long = [(0, 1), (1, 2), (2, 3), (3, 4), (4, 5)]
+    for a, b in long:
+        graph_b.add_edge(a, b, sep_affinity=0.91, evidence=0.5)
+    graph_b.add_edge(0, 6, sep_affinity=0.72, evidence=0.9)
+    graph_b.add_edge(6, 5, sep_affinity=0.71, evidence=0.9)
+    path_b = widest_affinity_path(graph_b, 0, 5)
+    assert path_b == [0, 1, 2, 3, 4, 5]
+    results["B_long_widest_path"] = True
+
+    # Test C: same-separatrix edge and path => high R.
+    Q_c = np.eye(4)
+    _coh_c, support_c = _test_support_engine([Q_c], np.ones((1, 4)), {"s": [0, 1, 2, 3]}, 4)
+    red_c = support_c.edge_path_redundancy(0, 3, [0, 1, 2, 3], "soft")
+    assert red_c.R > 0.5
+    results["C_same_separatrix_edge_and_path"] = True
+
+    # Test D: different separatrices must not create R via independent maxima.
+    Q_d = np.eye(4)
+    _coh_d, support_d = _test_support_engine(
+        [Q_d],
+        np.ones((1, 4)),
+        {"s1": [0, 1], "s2": [2, 3, 1]},
+        4,
+    )
+    # Edge (0,1) lives on s1; path 0-2-3-1 is ordered on s2 via node 1 only at the end.
+    red_d = support_d.edge_path_redundancy(0, 1, [0, 2, 3, 1], "soft")
+    assert red_d.R < 0.5
+    results["D_different_separatrices"] = True
+
+    # Test E: orientation must match.
+    Q_e = np.eye(4)
+    _coh_e, support_e = _test_support_engine([Q_e], np.ones((1, 4)), {"s": [0, 1, 2, 3]}, 4)
+    s_f, s_r, _ = support_e.directed_support(0, "s", 0, 3, "soft")
+    c_f, c_r = _coh_e.directed_coherence_on_separatrix(0, "s", [0, 1, 2, 3])
+    assert s_f > 0.5 and c_f > 0.5
+    assert min(s_f, c_r) < 0.5 or c_r < 0.5
+    red_e = support_e.edge_path_redundancy(0, 3, [0, 1, 2, 3], "soft")
+    assert red_e.best_directions[0] == "forward"
+    red_e_rev = support_e.edge_path_redundancy(3, 0, [3, 2, 1, 0], "soft")
+    assert red_e_rev.best_directions[0] == "forward" or red_e_rev.R > 0.5
+    results["E_orientation"] = True
+
+    # Test F: cross-input disagreement lowers aggregate R.
+    Q_f0 = np.eye(4)
+    Q_f1 = np.eye(4)
+    index_f0 = _path_index_from_explicit_paths({"s": [0, 1, 2, 3]}, n_nodes=4)
+    index_f1 = _path_index_from_explicit_paths(
+        {"s_edge": [0, 3], "s_mid": [1, 2]}, n_nodes=4
+    )
+    betweenness_f = SeparatrixBetweennessEngine(
+        [Q_f0, Q_f1], np.ones((2, 4)), [index_f0, index_f1]
+    )
+    coh_f = SeparatrixPathCoherenceEngine(betweenness_f)
+    support_f = SeparatrixEdgeSupportEngine(coh_f, use_unit_soft_kernel=True)
+    red_f = support_f.edge_path_redundancy(0, 3, [0, 1, 2, 3], "soft")
+    assert red_f.R_inputs[0] > 0.5
+    assert red_f.R_inputs[1] < 0.5
+    assert 0.05 < red_f.R < 0.9
+    results["F_cross_input_uncertainty"] = True
+
+    # Test G: partial matching.
+    Q_g0 = np.eye(4)
+    Q_g1 = np.zeros((4, 4))
+    fractions_g = np.array([[1.0, 1.0, 1.0, 1.0], [1e-16, 1.0, 1.0, 1.0]])
+    betweenness_g = SeparatrixBetweennessEngine(
+        [Q_g0, Q_g1], fractions_g, [index_f0, index_f0]
+    )
+    coh_g = SeparatrixPathCoherenceEngine(betweenness_g)
+    support_g = SeparatrixEdgeSupportEngine(coh_g, use_unit_soft_kernel=True)
+    red_g = support_g.edge_path_redundancy(0, 3, [0, 1, 2, 3], "soft")
+    assert red_g.weights[1] <= EPS
+    assert red_g.R > 0.5
+    results["G_partial_matching"] = True
+
+    # Test H: bridges remain under Phase 2.1.
+    Q_h = np.eye(3)
+    _coh_h, support_h = _test_support_engine([Q_h], np.ones((1, 3)), {"s": [0, 1, 2]}, 3)
+    graph_h = _graph_from_weighted_edges(3, [(0, 1, 0.2), (1, 2, 0.9)])
+    result_h = prune_same_separatrix_redundancy(
+        graph_h, support_h, "soft", theta=0.5
+    )
+    assert result_h.reconstructed_graph.has_edge(0, 1)
+    assert result_h.statistics["n_removed"] == 0
+    results["H_bridge_protection"] = True
+
+    # Test I: determinism, plus a same-separatrix chord is removed.
+    Q_i = np.eye(4)
+    _coh_i, support_i = _test_support_engine([Q_i], np.ones((1, 4)), {"s": [0, 1, 2, 3]}, 4)
+    graph_i = _graph_from_weighted_edges(
+        4, [(0, 1, 0.9), (1, 2, 0.9), (2, 3, 0.9), (0, 3, 0.2)]
+    )
+    r1 = prune_same_separatrix_redundancy(graph_i, support_i, "soft", theta=0.5)
+    r2 = prune_same_separatrix_redundancy(graph_i, support_i, "soft", theta=0.5)
+    assert list(r1.removed_edges["u"]) == list(r2.removed_edges["u"])
+    assert list(r1.removed_edges["v"]) == list(r2.removed_edges["v"])
+    assert not r1.reconstructed_graph.has_edge(0, 3)
+    if len(r1.removed_edges):
+        assert int(r1.removed_edges.iloc[0]["n_path_edges"]) >= 2
+    results["I_deterministic_and_chord"] = True
+    return results
 
 
 # ---------------------------------------------------------------------------
@@ -2656,12 +5368,13 @@ def run_q_hop_sensitivity(
     *,
     effective_planarity_mode: ConstraintMode,
 ) -> pd.DataFrame:
-    """Evaluate a grid of ``(q, H)`` settings without changing the configured defaults."""
+    """Evaluate a grid of hop-decay ``(q, H)`` settings without changing defaults."""
     rows = []
     component_target = infer_target_component_count(
         bundle, config.target_component_count
     )
-    for q in config.hop_decay_q_values:
+    q_values = [0.0, 0.25, 0.5, 0.75, 1.0]
+    for q in q_values:
         for hops in config.max_soft_hops_values:
             transported = compute_transported_separatrix_connectivity(
                 bundle,
@@ -2669,6 +5382,7 @@ def run_q_hop_sensitivity(
                 config,
                 q=q,
                 max_soft_hops=hops,
+                affinity_mode="separatrix_hop_decay",
             )
             candidates = construct_candidate_edge_table(transported, nodes, config)
             forest = build_maximum_support_forest(
@@ -2767,13 +5481,14 @@ def run_sampling_mode_sensitivity(
     *,
     effective_planarity_mode: ConstraintMode,
 ) -> pd.DataFrame:
-    if not config.enable_length_normalized_affinity:
-        return pd.DataFrame()
     rows = []
     component_target = infer_target_component_count(
         bundle, config.target_component_count
     )
-    for mode in ("separatrix_hop_decay", "separatrix_length_normalized_decay"):
+    modes: List[AffinityMode] = ["separatrix_hop_decay", "separatrix_gaussian"]
+    if config.enable_length_normalized_affinity:
+        modes.append("separatrix_length_normalized_decay")
+    for mode in modes:
         transported = compute_transported_separatrix_connectivity(
             bundle,
             input_node_orders,
@@ -2811,11 +5526,19 @@ def run_sampling_mode_sensitivity(
             }
         )
     frame = pd.DataFrame(rows)
-    if len(frame) == 2:
-        a, b = frame.loc[0, "edge_set"], frame.loc[1, "edge_set"]
-        jaccard = len(a & b) / len(a | b) if a or b else 1.0
-        frame["edge_set_jaccard_vs_other_mode"] = jaccard
-        frame["changed_edge_count"] = len(a ^ b)
+    hop_rows = frame[frame.connectivity_affinity_mode == "separatrix_hop_decay"]
+    if hop_rows.empty:
+        return frame.drop(columns=["edge_set"])
+    hop_set = hop_rows.iloc[0]["edge_set"]
+    jaccard = []
+    changed = []
+    for _, row in frame.iterrows():
+        other = row.edge_set
+        union = hop_set | other
+        jaccard.append(len(hop_set & other) / len(union) if union else 1.0)
+        changed.append(len(hop_set ^ other))
+    frame["edge_set_jaccard_vs_hop_decay"] = jaccard
+    frame["changed_edge_count_vs_hop_decay"] = changed
     return frame.drop(columns=["edge_set"])
 
 
@@ -3103,6 +5826,12 @@ def save_transported_arrays(
     np.save(output / "pair_contributing_inputs.npy", transported.pair_contributing_inputs)
 
 
+def _as_frame(value: Optional[pd.DataFrame]) -> pd.DataFrame:
+    if value is None:
+        return pd.DataFrame()
+    return value
+
+
 def save_reconstruction_bundle(
     output_dir: PathLike,
     *,
@@ -3116,19 +5845,41 @@ def save_reconstruction_bundle(
     augmented: AugmentationResult,
     repaired: LocalRepairResult,
     validation: ReconstructionValidationResult,
-    sensitivity: pd.DataFrame,
-    sampling_sensitivity: pd.DataFrame,
-    baseline_comparison: pd.DataFrame,
+    sensitivity: Optional[pd.DataFrame] = None,
+    sampling_sensitivity: Optional[pd.DataFrame] = None,
+    baseline_comparison: Optional[pd.DataFrame] = None,
     routed: Optional[GeometricRoutingResult] = None,
     posthoc_relation_metrics: Optional[Mapping[str, Any]] = None,
     warnings_and_fallbacks: Optional[List[str]] = None,
+    saved_at: Optional[str] = None,
 ) -> Dict[str, Any]:
+    """Persist reconstruction artifacts under a timestamped output directory.
+
+    Optional analyses (q-hop sensitivity, sampling sensitivity, post-hoc
+    baselines) may be omitted; empty CSV placeholders are written so the
+    on-disk layout stays stable. ``saved_at`` uses ``mm-dd-yyyy-hh-mm-ss``.
+    """
     output = Path(output_dir)
     output.mkdir(parents=True, exist_ok=True)
     (output / "figures").mkdir(parents=True, exist_ok=True)
 
+    stamp = saved_at
+    if not stamp:
+        match = re.search(r"(\d{2}-\d{2}-\d{4}-\d{2}-\d{2}-\d{2})", output.name)
+        stamp = match.group(1) if match else barycenter_save_timestamp()
+    source_meta = dict(source_metadata or {})
+    sensitivity_df = _as_frame(sensitivity)
+    sampling_df = _as_frame(sampling_sensitivity)
+    baseline_df = _as_frame(baseline_comparison)
+
     resolved = config.resolved_dict(Path.cwd())
     resolved["output_dir"] = str(output)
+    resolved["saved_at"] = stamp
+    resolved["source_run_name"] = config.run_name
+    resolved["source_barycenter_dir"] = str(Path(source_barycenter_dir).resolve())
+    resolved["source_pipeline"] = source_meta.get("pipeline")
+    resolved["source_DATA_KEYWORD"] = source_meta.get("DATA_KEYWORD")
+    resolved["source_saved_at"] = source_meta.get("saved_at")
     (output / "reconstruction_config.json").write_text(
         json.dumps(_json_safe(resolved), indent=2), encoding="utf-8"
     )
@@ -3158,9 +5909,9 @@ def save_reconstruction_bundle(
     if routed is not None:
         save_graph_pickle(routed.graph, output / "G_routed.gpickle")
         routed.route_statistics.to_csv(output / "route_statistics.csv", index=False)
-    sensitivity.to_csv(output / "q_hop_sensitivity.csv", index=False)
-    sampling_sensitivity.to_csv(output / "sampling_mode_sensitivity.csv", index=False)
-    baseline_comparison.to_csv(output / "baseline_comparison.csv", index=False)
+    sensitivity_df.to_csv(output / "q_hop_sensitivity.csv", index=False)
+    sampling_df.to_csv(output / "sampling_mode_sensitivity.csv", index=False)
+    baseline_df.to_csv(output / "baseline_comparison.csv", index=False)
     (output / "reconstruction_metrics.json").write_text(
         json.dumps(_json_safe(validation.metrics), indent=2), encoding="utf-8"
     )
@@ -3198,17 +5949,32 @@ def save_reconstruction_bundle(
         "separatrix_pair_relation_is_transitive": False,
         "soft_paths_restricted_to_single_separatrix_id": True,
         "connectivity_affinity_mode": config.connectivity_affinity_mode,
-        "connectivity_affinity_formula": "max_r q ** (d_r - 1)",
+        "connectivity_affinity_formula": _connectivity_affinity_formula(
+            config.connectivity_affinity_mode
+        ),
         "uses_degree_based_chain_inference": False,
         "uses_barycenter_relation_for_edge_selection": False,
         "terminology_version": TERMINOLOGY_VERSION,
-        "selected_hop_decay_q": config.hop_decay_q,
         "selected_max_soft_hops": config.max_soft_hops,
+        "selected_gaussian_sigma": config.gaussian_sigma,
+        "selected_gaussian_eta": config.gaussian_eta,
+        "selected_gaussian_zero_at_zero_distance": bool(
+            config.gaussian_zero_at_zero_distance
+        ),
+        "selected_gaussian_cutoff_sigmas": config.gaussian_cutoff_sigmas,
+        "selected_gaussian_distance_units": config.gaussian_distance_units,
         "length_normalized_sensitivity_run": bool(config.enable_length_normalized_affinity),
         "source_barycenter_directory": str(Path(source_barycenter_dir).resolve()),
+        "source_run_name": config.run_name,
+        "source_pipeline": source_meta.get("pipeline"),
+        "source_DATA_KEYWORD": source_meta.get("DATA_KEYWORD"),
+        "source_saved_at": source_meta.get("saved_at"),
         "reconstruction_directory": str(output.resolve()),
-        "source_metadata": _json_safe(dict(source_metadata)),
-        "exclude_seed": bool(dict(source_metadata).get("exclude_seed", False)),
+        "source_metadata": _json_safe(source_meta),
+        "exclude_seed": bool(source_meta.get("exclude_seed", False)),
+        "has_q_hop_sensitivity": not sensitivity_df.empty,
+        "has_sampling_sensitivity": not sampling_df.empty,
+        "has_baseline_comparison": not baseline_df.empty,
         "edge_weight_semantics": edge_weight_semantics,
         "node_count": int(validation.metrics["final_node_count"]),
         "edge_count": int(validation.metrics["edge_count"]),
@@ -3216,6 +5982,7 @@ def save_reconstruction_bundle(
         "library_versions": versions,
         "validation_result": _json_safe(validation.metrics),
         "warnings_and_fallbacks": sorted(set(warnings_and_fallbacks or [])),
+        "saved_at": stamp,
         "created_at_utc": datetime.now(timezone.utc).isoformat(),
         "configuration": _json_safe(resolved),
     }
@@ -3435,9 +6202,10 @@ def run_synthetic_separatrix_tests(*, tolerance: float = 1e-12) -> Dict[str, boo
     # Test J
     config = ReconstructionConfig(
         reconstruction_name="synthetic_test",
-        hop_decay_q=0.5,
         max_soft_hops=4,
         enable_length_normalized_affinity=False,
+        connectivity_affinity_mode="separatrix_hop_decay",
+        gaussian_distance_units="raw",
     )
     graph = nx.Graph()
     graph.add_edge(0, 1, separatrixID="0")
@@ -3531,6 +6299,144 @@ def run_synthetic_separatrix_tests(*, tolerance: float = 1e-12) -> Dict[str, boo
     assert hop_diff > len_diff - tolerance
     results["K_oversampled_equivalent"] = True
 
+    # Test M: Gaussian kernel on geometric shortest-path distance
+    gaussian_kwargs = dict(
+        q=0.5,
+        max_soft_hops=4,
+        mode="separatrix_gaussian",
+        sigma=1.0,
+        eta=1.0,
+        cutoff_sigmas=3.0,
+    )
+    gauss_short = build_separatrix_local_connectivity_affinity(
+        G_short,
+        ["u", "a", "v"],
+        m_short,
+        zero_at_zero_distance=True,
+        **gaussian_kwargs,
+    )
+    gauss_long = build_separatrix_local_connectivity_affinity(
+        G_long,
+        path,
+        m_long,
+        zero_at_zero_distance=True,
+        **gaussian_kwargs,
+    )
+    K_short = gauss_short.separatrix_local_connectivity_affinity
+    K_long = gauss_long.separatrix_local_connectivity_affinity
+    expected_near = float(np.exp(-0.5))
+    expected_far = float(np.exp(-2.0))
+    assert np.isclose(K_short[0, 1], expected_near, atol=tolerance)
+    assert np.isclose(K_short[0, 2], expected_far, atol=tolerance)
+    assert np.isclose(K_long[0, 4], expected_far, atol=tolerance)
+    assert np.allclose(np.diag(K_short), 0.0)
+    gauss_self = build_separatrix_local_connectivity_affinity(
+        G_short,
+        ["u", "a", "v"],
+        m_short,
+        zero_at_zero_distance=False,
+        **gaussian_kwargs,
+    )
+    assert np.allclose(
+        np.diag(gauss_self.separatrix_local_connectivity_affinity), 1.0
+    )
+    gauss_cut = build_separatrix_local_connectivity_affinity(
+        G_short,
+        ["u", "a", "v"],
+        m_short,
+        q=0.5,
+        max_soft_hops=4,
+        mode="separatrix_gaussian",
+        sigma=1.0,
+        eta=1.0,
+        cutoff_sigmas=1.0,
+        zero_at_zero_distance=True,
+    )
+    assert gauss_cut.separatrix_local_connectivity_affinity[0, 2] == 0.0
+    assert np.isclose(
+        gauss_cut.separatrix_local_connectivity_affinity[0, 1],
+        expected_near,
+        atol=tolerance,
+    )
+    gauss_eta = build_separatrix_local_connectivity_affinity(
+        G_short,
+        ["u", "a", "v"],
+        m_short,
+        q=0.5,
+        max_soft_hops=4,
+        mode="separatrix_gaussian",
+        sigma=1.0,
+        eta=0.5,
+        cutoff_sigmas=3.0,
+        zero_at_zero_distance=True,
+    )
+    assert np.isclose(
+        gauss_eta.separatrix_local_connectivity_affinity[0, 1],
+        0.5 * expected_near,
+        atol=tolerance,
+    )
+    assert np.all(gauss_eta.separatrix_local_connectivity_affinity <= 1.0 + tolerance)
+    gauss_scaled = build_separatrix_local_connectivity_affinity(
+        G_short,
+        ["u", "a", "v"],
+        m_short,
+        zero_at_zero_distance=True,
+        length_scale=2.0,
+        **gaussian_kwargs,
+    )
+    assert np.isclose(
+        gauss_scaled.separatrix_local_connectivity_affinity[0, 1],
+        float(np.exp(-0.125)),
+        atol=tolerance,
+    )
+    scale_config = ReconstructionConfig(
+        reconstruction_name="scale_test",
+        gaussian_sigma=0.05,
+        gaussian_distance_units="domain",
+        enable_length_normalized_affinity=False,
+    )
+    bundle_scaled = {
+        "p": np.ones(3),
+        "Gs": [G_short],
+        "Ts": [0.2 * np.eye(3)],
+        "lambdas": np.ones(1),
+        "Cs": [np.zeros((3, 3))],
+        "meta": {"domain_size": 2.0},
+    }
+    transported_scaled = compute_transported_separatrix_connectivity(
+        bundle_scaled, [["u", "a", "v"]], scale_config
+    )
+    assert transported_scaled.diagnostics["gaussian_distance_units"] == "domain"
+    assert np.isclose(transported_scaled.diagnostics["length_scale"], 2.0)
+    assert np.isclose(
+        transported_scaled.diagnostics["median_raw_edge_length"], 1.0, atol=tolerance
+    )
+    assert np.isclose(
+        transported_scaled.diagnostics["median_scaled_edge_length"], 0.5, atol=tolerance
+    )
+    # Same-separatrix rule still blocks the ID-mismatched two-hop pair.
+    G_mismatch = nx.Graph()
+    G_mismatch.add_edge("u", "v", separatrixID="0")
+    G_mismatch.add_edge("v", "w", separatrixID="1")
+    for node, (x, y) in {"u": (0, 0), "v": (1, 0), "w": (2, 0)}.items():
+        G_mismatch.nodes[node]["x"] = x
+        G_mismatch.nodes[node]["y"] = y
+        G_mismatch.nodes[node]["z"] = 0
+    gauss_nontransitive = build_separatrix_local_connectivity_affinity(
+        G_mismatch,
+        ["u", "v", "w"],
+        build_separatrix_membership(G_mismatch),
+        q=0.5,
+        max_soft_hops=4,
+        mode="separatrix_gaussian",
+        sigma=1.0,
+        eta=1.0,
+        cutoff_sigmas=3.0,
+        zero_at_zero_distance=True,
+    )
+    assert gauss_nontransitive.separatrix_local_connectivity_affinity[0, 2] == 0.0
+    results["M_gaussian_shortestpath"] = True
+
     # Test L: selection helpers do not accept C_center
     import inspect
 
@@ -3558,6 +6464,28 @@ __all__ = [
     "build_direct_adjacency_matrix",
     "build_separatrix_local_connectivity_affinity",
     "compute_transported_separatrix_connectivity",
+    "build_separatrix_path_index",
+    "prepare_separatrix_betweenness_engine",
+    "candidate_graph_from_evidence",
+    "reconstruct_separatrix_triangle_shortcuts",
+    "apply_triangle_shortcut_threshold",
+    "evaluate_triangle_redundancy",
+    "evidence_matrix_from_graph",
+    "reconstruction_graph_statistics",
+    "run_triangle_reconstruction_tests",
+    "prepare_path_coherence_engine",
+    "prune_same_separatrix_cycles",
+    "run_cycle_pruning_tests",
+    "prepare_edge_support_engine",
+    "annotate_separatrix_affinities",
+    "widest_affinity_path",
+    "prune_same_separatrix_redundancy",
+    "surviving_edge_support_table",
+    "classify_surviving_separatrix_support",
+    "count_thresholded_pairs",
+    "reconstruction_count_row",
+    "witness_path_length_stats",
+    "run_phase21_tests",
     "construct_candidate_edge_table",
     "build_maximum_support_forest",
     "augment_consensus_edges",

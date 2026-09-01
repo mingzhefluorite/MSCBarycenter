@@ -714,7 +714,7 @@ def _pfgw_update_features(p, lambdas, T, Ys, eps=1e-15):
 def pfgw_barycenters(
         N, Ys, Cs, ps=None, p=None, Lambda_list=None, lambdas=None, alpha=0.5,
         loss_fun='square_loss', max_iter=1000, tol=1e-9, verbose=False,
-        log=False, init_C=None, init_X=None, random_state=None, stop_criterion='barycenter',
+        log=False, init_C=None, init_X=None, init_T=None, random_state=None, stop_criterion='barycenter',
         gw_restarts=1, gw_seed_start=0, debug=False, accumulate_fails_limit=10, **kwargs):
     r"""
     Returns the Partial Fused Gromov-Wasserstein barycenters of S structured objects
@@ -728,6 +728,12 @@ def pfgw_barycenters(
         Feature matrix of the barycenter
     log : dict
         Only returned when log=True. Contains 'T', 'p', 'err', 'X'.
+
+    init_T : list of array-like, optional
+        Warm-start couplings, one ``(N, n_s)`` plan per input. Used as ``G0``
+        on the first inner PFGW solve (and as the first ``gw_restarts``
+        candidate). Later barycenter iterations reuse the latest plans.
+        Default ``None`` keeps the original random ``G0`` initialization.
     """
     if stop_criterion not in ['barycenter']:
         raise ValueError(f"Unknown `stop_criterion='{stop_criterion}'`. Use one of: {'barycenter'}.")
@@ -764,6 +770,18 @@ def pfgw_barycenters(
     else:
         X = init_X
 
+    T_warm = None
+    if init_T is not None:
+        T_warm = [np.asarray(Ts, dtype=float).copy() for Ts in init_T]
+        if len(T_warm) != S:
+            raise ValueError(f"init_T length {len(T_warm)} != n_inputs {S}")
+        for s, T0 in enumerate(T_warm):
+            if T0.ndim != 2 or T0.shape[0] != N or T0.shape[1] != Cs[s].shape[0]:
+                raise ValueError(
+                    f"init_T[{s}] shape {T0.shape} incompatible with "
+                    f"N={N}, n_s={Cs[s].shape[0]}"
+                )
+
     if Lambda_list is None:
         Lambda_list = np.array([np.max(Cs[s]) for s in range(S)])
 
@@ -790,9 +808,10 @@ def pfgw_barycenters(
         res = []
         for s in range(S):
             M_s = dist(X, Ys[s])
+            G0_s = T_warm[s] if T_warm is not None else None
             if gw_restarts <= 1:
                 T_best = partial_fused_gromov_ver1(
-                    M_s, C, Cs[s], p, ps[s], Lambda_list[s], alpha=alpha, G0=None,
+                    M_s, C, Cs[s], p, ps[s], Lambda_list[s], alpha=alpha, G0=G0_s,
                     numItermax_gw=max_iter, tol=1e-5, log=False, verbose=verbose,
                     seed=gw_seed_start, **gw_kwargs)
                 
@@ -803,8 +822,9 @@ def pfgw_barycenters(
                 T_best, best_cost = None, None
                 for r in range(gw_restarts):
                     seed = gw_seed_start + r
+                    G0_r = G0_s if (r == 0 and G0_s is not None) else None
                     T = partial_fused_gromov_ver1(
-                        M_s, C, Cs[s], p, ps[s], Lambda_list[s], alpha=alpha, G0=None,
+                        M_s, C, Cs[s], p, ps[s], Lambda_list[s], alpha=alpha, G0=G0_r,
                         numItermax_gw=max_iter, tol=1e-5, log=False, verbose=verbose,
                         seed=seed, **gw_kwargs)
                     dist_val, penalty = PFGW_dist_with_penalty(
@@ -821,6 +841,8 @@ def pfgw_barycenters(
 
         T = res
         T = _perturb_zero_rows_columns(T, eps=1e-15)
+        if init_T is not None:
+            T_warm = [np.asarray(Ts, dtype=float).copy() for Ts in T]
 
         C = pfgw_update_square_loss_nb(p, lambdas, T, Cs)
         X = _pfgw_update_features(p, lambdas, T, Ys)
@@ -850,6 +872,164 @@ def pfgw_barycenters(
         return C, X, log_
     else:
         return C, X
+
+
+def lambda_decay_schedule(lambda_init=1.0, lambda_target=0.01, decay_steps=5):
+    """Geometric λ sequence from ``lambda_init`` down to ``lambda_target``.
+
+    The uniform quotient is ``q = (lambda_init / lambda_target) ** (1 / decay_steps)``.
+    Starting from ``lambda_current = lambda_init``, each subsequent value is
+    ``max(lambda_target, lambda_current / q)``. This yields ``decay_steps + 1``
+    values when ``decay_steps >= 1``. ``decay_steps == 0`` returns
+    ``[lambda_target]`` only.
+    """
+    lam0 = float(lambda_init)
+    lamT = float(lambda_target)
+    steps = int(decay_steps)
+    if lam0 <= 0.0 or lamT <= 0.0:
+        raise ValueError("lambda_init and lambda_target must be positive")
+    if lamT > lam0:
+        raise ValueError("lambda_target must be <= lambda_init")
+    if steps < 0:
+        raise ValueError("decay_steps must be >= 0")
+    if steps == 0 or np.isclose(lam0, lamT):
+        return [lamT]
+    q = (lam0 / lamT) ** (1.0 / steps)
+    schedule = []
+    lam = lam0
+    for _ in range(steps + 1):
+        schedule.append(float(lam))
+        if lam <= lamT or np.isclose(lam, lamT):
+            break
+        lam = max(lamT, lam / q)
+    schedule[-1] = lamT
+    return schedule
+
+
+def _pfgw_loss_and_masses(C, X, T, Cs, Ys, p, ps, Lambda_list, lambdas, alpha):
+    """Weighted PFGW loss sum and per-input transported mass."""
+    total = 0.0
+    masses = []
+    p = np.asarray(p, dtype=float)
+    for s in range(len(Cs)):
+        M_s = dist(X, Ys[s])
+        d, penalty = PFGW_dist_with_penalty(
+            M_s, C, Cs[s], T[s], p, ps[s], Lambda_list[s], alpha=alpha
+        )
+        total += float(lambdas[s]) * (float(d) + float(penalty))
+        masses.append(float(np.asarray(T[s]).sum()))
+    return float(total), masses
+
+
+def pfgw_barycenters_lambda_converge(
+        N, Ys, Cs, ps=None, p=None, lambdas=None, alpha=0.5,
+        lambda_init=1.0, lambda_target=0.01, decay_steps=5,
+        loss_fun='square_loss', max_iter=1000, tol=1e-9, verbose=False,
+        init_C=None, init_X=None, init_T=None, random_state=None,
+        stop_criterion='barycenter', gw_restarts=1, gw_seed_start=0,
+        debug=False, accumulate_fails_limit=10, progress=True, **kwargs):
+    r"""
+    PFGW barycenter with geometric decay of the partial-matching penalty λ.
+
+    For each λ on the schedule from :func:`lambda_decay_schedule`, a fully
+    converged PFGW barycenter is computed. The encodings ``(C, X)`` and
+    couplings ``log['T']`` warm-start the next (smaller) λ. The returned
+    barycenter is the one obtained at ``lambda_target``.
+
+    Returns
+    -------
+    C_center_final : ndarray, shape (N, N)
+    X_center_final : ndarray, shape (N, d)
+    log_final : dict
+        Same keys as :func:`pfgw_barycenters` (``T``, ``p``, ``err``, ``X``),
+        plus ``lambda_schedule``, ``lambda_converge_loss``,
+        ``lambda_converge_transported_mass``, ``lambda_init``,
+        ``lambda_target``, and ``decay_steps``.
+    """
+    S = len(Cs)
+    if lambdas is None:
+        lambdas = [1. / S] * S
+
+    schedule = lambda_decay_schedule(lambda_init, lambda_target, decay_steps)
+    C_cur = None if init_C is None else np.asarray(init_C, dtype=float).copy()
+    X_cur = None if init_X is None else np.asarray(init_X, dtype=float).copy()
+    T_cur = None if init_T is None else [np.asarray(Ts, dtype=float).copy() for Ts in init_T]
+
+    losses = []
+    masses_hist = []
+    log_final = None
+    C_center_final = None
+    X_center_final = None
+
+    try:
+        from tqdm.auto import tqdm
+    except ImportError:
+        def tqdm(iterable, **_kwargs):
+            return iterable
+
+    pbar = tqdm(schedule, desc="λ convergence", unit="λ", disable=not progress)
+    for step, lam in enumerate(pbar):
+        Lambda_list = [float(lam)] * S
+        C_center, X_center, log = pfgw_barycenters(
+            N=N,
+            Ys=Ys,
+            Cs=Cs,
+            ps=ps,
+            p=p,
+            Lambda_list=Lambda_list,
+            lambdas=lambdas,
+            alpha=alpha,
+            loss_fun=loss_fun,
+            max_iter=max_iter,
+            tol=tol,
+            verbose=verbose,
+            log=True,
+            init_C=C_cur,
+            init_X=X_cur,
+            init_T=T_cur,
+            random_state=random_state,
+            stop_criterion=stop_criterion,
+            gw_restarts=gw_restarts,
+            gw_seed_start=gw_seed_start,
+            debug=debug,
+            accumulate_fails_limit=accumulate_fails_limit,
+            **kwargs,
+        )
+        p_used = log.get("p", p)
+        loss_sum, masses = _pfgw_loss_and_masses(
+            C_center, X_center, log["T"], Cs, Ys, p_used, ps, Lambda_list, lambdas, alpha
+        )
+        losses.append(loss_sum)
+        masses_hist.append(masses)
+
+        if progress:
+            try:
+                pbar.set_postfix_str(
+                    f"λ={lam:.4g}  ΣFPGW={loss_sum:.6g}  "
+                    f"masses=[{', '.join(f'{m:.4g}' for m in masses)}]"
+                )
+            except AttributeError:
+                pass
+            print(
+                f"[λ converge {step + 1}/{len(schedule)}] λ={lam:.6g}  "
+                f"FPGW loss sum={loss_sum:.6g}  "
+                f"transported mass={masses}"
+            )
+
+        C_cur = np.asarray(C_center, dtype=float).copy()
+        X_cur = np.asarray(X_center, dtype=float).copy()
+        T_cur = [np.asarray(Ts, dtype=float).copy() for Ts in log["T"]]
+        C_center_final = C_cur
+        X_center_final = X_cur
+        log_final = log
+
+    log_final["lambda_schedule"] = list(schedule)
+    log_final["lambda_converge_loss"] = list(losses)
+    log_final["lambda_converge_transported_mass"] = [list(m) for m in masses_hist]
+    log_final["lambda_init"] = float(lambda_init)
+    log_final["lambda_target"] = float(lambda_target)
+    log_final["decay_steps"] = int(decay_steps)
+    return C_center_final, X_center_final, log_final
 
 
 def mpgw_barycenters(

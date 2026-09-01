@@ -643,6 +643,213 @@ def fused_gromov_wasserstein(
         return G0[: len(p), : len(q)]
 
 
+def partial_fused_gromov_mass(
+    M,
+    C1,
+    C2,
+    p,
+    q,
+    m=None,
+    alpha=0.5,
+    nb_dummies=1,
+    G0=None,
+    thres=1,
+    numItermax=100000,
+    numItermax_gw=1000,
+    tol=1e-7,
+    log=False,
+    verbose=False,
+    line_search=True,
+    **kwargs
+):
+    r"""
+    Mass-specified (fixed-mass) partial fused Gromov-Wasserstein.
+
+    Minimizes
+
+        (1 - alpha) * <T, M> + alpha * GW(C1, C2, T)
+
+    over nonnegative couplings with marginal inequalities and exact total mass
+
+        T 1 <= p,   T^T 1 <= q,   1^T T 1 = m,
+
+    where ``m <= min(||p||_1, ||q||_1)``. This is the Chapel / Bai fixed-mass
+    formulation (dummy-node EMD inner loop), as opposed to the Lambda-penalty
+    solver ``partial_fused_gromov_ver1``.
+
+    If ``m`` is omitted or at least ``min(||p||_1, ||q||_1)``, this reduces to
+    full fused GW.
+
+    Parameters
+    ----------
+    M : ndarray, shape (ns, nt)
+        Feature cost matrix between source and target.
+    C1, C2 : ndarray
+        Intra-domain relation / metric matrices.
+    p, q : ndarray
+        Source and target masses.
+    m : float, optional
+        Mass to transport. Default is ``min(sum(p), sum(q))`` (full transport).
+    alpha : float, optional
+        Weight on the Gromov term (``1 - alpha`` on features).
+    nb_dummies : int, optional
+        Dummy points for the partial EMD linearization. Increased automatically
+        on EMD failure, matching ``lib/mpfgw``.
+
+    Returns
+    -------
+    T : ndarray, shape (ns, nt)
+        Optimal partial coupling with ``sum(T) ~= m``.
+    log : dict
+        Returned if ``log=True``. Includes ``mpfgw_dist`` and ``mass``.
+    """
+    p = np.asarray(p, dtype=float).reshape(-1)
+    q = np.asarray(q, dtype=float).reshape(-1)
+    M = np.asarray(M, dtype=float)
+    C1 = np.asarray(C1, dtype=float)
+    C2 = np.asarray(C2, dtype=float)
+
+    p_sum = float(p.sum())
+    q_sum = float(q.sum())
+    m_max = min(p_sum, q_sum)
+    if m is None:
+        m = m_max
+    m = float(m)
+    if m < 0:
+        raise ValueError("m must be nonnegative.")
+    if m > m_max + 1e-12:
+        raise ValueError(
+            f"Infeasible mass m={m} > min(||p||_1, ||q||_1)={m_max}."
+        )
+    m = min(m, m_max)
+
+    if m >= m_max - 1e-12 and abs(p_sum - q_sum) <= 1e-9:
+        return fused_gromov_wasserstein(
+            M, C1, C2, p, q, alpha=alpha, G0=G0, thres=thres,
+            numItermax=numItermax, numItermax_gw=numItermax_gw, tol=tol,
+            log=log, verbose=verbose, line_search=line_search, **kwargs
+        )
+
+    if G0 is None:
+        denom = p_sum * q_sum
+        G0 = (np.outer(p, q) * (m / denom)) if denom > 0 else np.zeros((p.size, q.size))
+    else:
+        G0 = np.asarray(G0, dtype=float).copy()
+        gsum = float(G0.sum())
+        if gsum > 0 and abs(gsum - m) > 1e-12:
+            G0 *= m / gsum
+
+    n1, n2 = p.shape[0], q.shape[0]
+    dummy_mass_p = (q_sum - m)
+    dummy_mass_q = (p_sum - m)
+
+    cpt = 0
+    err = 1.0
+    log_dict = {"err": [], "emd_warnings": []} if log else None
+    last_nb = int(nb_dummies)
+    emd_itermax = int(numItermax)
+
+    while err > tol and cpt < numItermax_gw:
+        Gprev = G0.copy()
+        M_gw = gwgrad_partial(C1, C2, Gprev)
+        M_combined = (1.0 - alpha) * M + alpha * M_gw
+
+        solved = False
+        Gc = None
+        nb = max(1, int(last_nb))
+        last_error = None
+        while nb <= 301:
+            p_ext = np.append(p, [dummy_mass_p / nb] * nb)
+            q_ext = np.append(q, [dummy_mass_q / nb] * nb)
+            M_emd = np.zeros((n1 + nb, n2 + nb), dtype=float)
+            M_emd[:n1, :n2] = M_combined
+            fill = float(np.max(M_combined)) if M_combined.size else 0.0
+            dummy_cost = fill * 2.0 if fill > 0.0 else (abs(fill) * 1e3 + 1.0)
+            M_emd[-nb:, -nb:] = dummy_cost
+            try:
+                Gc, logemd = emd(
+                    p_ext,
+                    q_ext,
+                    M_emd,
+                    numItermax=emd_itermax,
+                    numThreads=thres,
+                    log=True,
+                    **kwargs
+                )
+            except Exception as exc:
+                last_error = exc
+                nb += 50
+                continue
+            warning = logemd.get("warning") if isinstance(logemd, dict) else None
+            if warning is not None and nb < 301:
+                if log_dict is not None:
+                    log_dict["emd_warnings"].append((nb, warning))
+                nb += 50
+                continue
+            if nb > 0 and np.any(Gc[-nb:, -nb:] > 1e-12):
+                nb += 50
+                continue
+            solved = True
+            last_nb = nb
+            break
+
+        if not solved or Gc is None:
+            raise RuntimeError(
+                f"Mass-specified FPGW EMD failed (m={m}, last error={last_error}). "
+                "Try increasing nb_dummies or relaxing rho."
+            )
+
+        G0 = Gc[:n1, :n2]
+        deltaG = G0 - Gprev
+
+        if line_search:
+            a = 2.0 * alpha * gwloss_partial(C1, C2, deltaG)
+            b = 2.0 * np.sum(M_combined * deltaG)
+            if a > 0:
+                if b > 0:
+                    gamma = 0.0
+                    cpt = numItermax_gw
+                else:
+                    gamma = min(1.0, np.divide(-b, 2.0 * a))
+            else:
+                if (a + b) < 0:
+                    gamma = 1.0
+                else:
+                    gamma = 0.0
+                    cpt = numItermax_gw
+        else:
+            gamma = 1.0
+
+        Gnew = Gprev + gamma * deltaG
+        if cpt % 10 == 0:
+            scale = max(np.linalg.norm(Gprev), np.linalg.norm(Gnew), 1e-15)
+            err = float(np.linalg.norm(Gnew - Gprev) / scale)
+            if log_dict is not None:
+                log_dict["err"].append(err)
+            if verbose:
+                if cpt % 200 == 0:
+                    print(
+                        "{:5s}|{:12s}|{:12s}".format("It.", "Err", "Loss")
+                        + "\n" + "-" * 31
+                    )
+                loss = (1.0 - alpha) * np.sum(M * Gnew) + alpha * gwloss_partial(
+                    C1, C2, Gnew
+                )
+                print("{:5d}|{:8e}|{:8e}".format(cpt, err, loss))
+
+        G0 = Gnew
+        cpt += 1
+
+    dist = (1.0 - alpha) * np.sum(M * G0) + alpha * gwloss_partial(C1, C2, G0)
+    if log:
+        log_dict["mpfgw_dist"] = float(dist)
+        log_dict["mass"] = float(G0.sum())
+        log_dict["m_target"] = float(m)
+        log_dict["nb_dummies"] = int(last_nb)
+        return G0, log_dict
+    return G0
+
+
 @nb.njit()
 def cost_matrix_d(X, Y, loss="square"):
     """
@@ -1874,3 +2081,19 @@ def PFGW_dist_with_penalty(M, C1, C2, gamma, p1, p2, Lambda, alpha=0.5):
     dist = (1 - alpha) * feat_dist + alpha * gw_dist
     penalty = Lambda * (p1.sum() ** 2 + p2.sum() ** 2 - 2 * gamma.sum() ** 2)
     return dist, penalty
+
+
+def MPFGW_dist(M, C1, C2, gamma, alpha=0.5):
+    """
+    Mass-specified fused GW cost of a coupling (no mass-deletion penalty).
+
+    Uses the same ``(1-alpha) * <M, T> + alpha * GW`` mix as
+    ``fused_gromov_wasserstein`` / ``partial_fused_gromov_mass``.
+    """
+    feat_dist = float(np.sum(np.asarray(M, dtype=float) * np.asarray(gamma, dtype=float)))
+    gw_dist = float(gwloss_partial(
+        np.asarray(C1, dtype=float),
+        np.asarray(C2, dtype=float),
+        np.asarray(gamma, dtype=float),
+    ))
+    return (1.0 - float(alpha)) * feat_dist + float(alpha) * gw_dist
